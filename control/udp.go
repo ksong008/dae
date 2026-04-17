@@ -486,6 +486,7 @@ func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data [
 			}
 			return nil
 		}
+		RecordDownloadTraffic(int64(len(data)))
 		return nil
 	}
 	if err := send(log, data, from, clientAddr, cacheSlot); err != nil {
@@ -1070,6 +1071,7 @@ getNew:
 	if lifecycle, ok := newUdpSessionLifecycleContext(ue, ""); ok {
 		lifecycle.reportTrafficSuccess()
 	}
+	RecordUploadTraffic(int64(len(data)))
 
 	// Print log.
 	// Only print routing for new connection to avoid the log exploded (Quic and BT).
