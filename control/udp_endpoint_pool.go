@@ -1092,6 +1092,24 @@ type UdpEndpointOptions struct {
 
 var DefaultUdpEndpointPool = NewUdpEndpointPool()
 
+func (p *UdpEndpointPool) Count() (n int) {
+	for i := range p.shards {
+		shard := &p.shards[i]
+		shard.mu.RLock()
+		for _, ue := range shard.pool {
+			if ue == nil {
+				continue
+			}
+			if ue.failed.Load() || ue.IsDead() || (!p.endpointGenerationCurrent(ue) && !p.endpointSurvivesDialerInvalidation(ue)) {
+				continue
+			}
+			n++
+		}
+		shard.mu.RUnlock()
+	}
+	return n
+}
+
 func NewUdpEndpointPool() *UdpEndpointPool {
 	p := &UdpEndpointPool{
 		janitorStop: make(chan struct{}),
