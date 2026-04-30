@@ -9,7 +9,7 @@ import (
 
 func TestRewriteAndLoadBpf(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
-		t.Fatalf("RemoveMemlock: %v", err)
+		t.Skipf("skipping loader test: RemoveMemlock failed: %v", err)
 	}
 	objs, err := rewriteAndLoadBpf(4, 6, 80, DefaultRingbufSizeBytes())
 	if err != nil {

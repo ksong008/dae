@@ -21,7 +21,7 @@ import (
 func ensureMemlock(t *testing.T) {
 	t.Helper()
 	if err := rlimit.RemoveMemlock(); err != nil {
-		t.Fatalf("RemoveMemlock: %v", err)
+		t.Skipf("skipping loader test: RemoveMemlock failed: %v", err)
 	}
 }
 
