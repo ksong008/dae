@@ -530,7 +530,7 @@ func (e *Engine) routeAwareDialContext(ctx context.Context, network, addr string
 	if err != nil {
 		return nil, err
 	}
-	conn, err := ctl.RouteDialTcp(&control.RouteDialParam{
+	conn, err := ctl.RouteDialTcp(control.RouteDialParam{
 		Ctx:         ctx,
 		Outbound:    consts.OutboundControlPlaneRouting,
 		Domain:      domain,

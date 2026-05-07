@@ -1,0 +1,122 @@
+name: daerust Promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      dae_wing_repository:
+        description: dae-wing repository
+        required: true
+        default: ksong008/dae-wing
+      dae_wing_ref:
+        description: dae-wing branch or ref
+        required: true
+        default: daewingrust
+      daed_repository:
+        description: daed repository
+        required: true
+        default: ksong008/daed
+      daed_ref:
+        description: daed branch or ref
+        required: true
+        default: daedrust
+
+permissions: read-all
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: daerust-promotion-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  promotion:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout dae
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          path: dae
+
+      - name: Checkout dae-wing
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.dae_wing_repository }}
+          ref: ${{ inputs.dae_wing_ref }}
+          fetch-depth: 0
+          submodules: recursive
+          path: dae-wing
+
+      - name: Checkout daed
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.daed_repository }}
+          ref: ${{ inputs.daed_ref }}
+          fetch-depth: 0
+          submodules: recursive
+          path: daed
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v5.0.0
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.12.0"
+          cache: pnpm
+          cache-dependency-path: |
+            daed/pnpm-lock.yaml
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.9"
+          cache-dependency-path: |
+            dae/go.mod
+            dae/go.sum
+            dae-wing/go.mod
+            dae-wing/go.sum
+            daed/wing/go.mod
+            daed/wing/go.sum
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang-15 llvm-15 rsync
+
+      - name: Prepare dae location assets
+        run: |
+          mkdir -p dae/.github/dae-assets
+          curl -L -o dae/.github/dae-assets/geoip.dat https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+          curl -L -o dae/.github/dae-assets/geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+
+      - name: Prepare dae eBPF artifacts
+        working-directory: dae
+        env:
+          CLANG: clang-15
+          STRIP: llvm-strip-15
+        run: make ebpf
+
+      - name: Overlay live dae-wing into daed/wing
+        run: |
+          rm -rf daed/wing
+          mkdir -p daed/wing
+          rsync -a --delete --exclude='.git' dae-wing/ daed/wing/
+          sed -i 's#=> ../dae#=> ../../dae#' daed/wing/go.mod
+
+      - name: Run daerust promotion gate
+        working-directory: dae
+        env:
+          DAE_LOCATION_ASSET: ${{ github.workspace }}/dae/.github/dae-assets
+          DAE_WING_REPO_DIR: ${{ github.workspace }}/dae-wing
+          DAED_REPO_DIR: ${{ github.workspace }}/daed
+        run: make rust-promotion-gate-local

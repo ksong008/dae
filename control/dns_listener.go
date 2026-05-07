@@ -6,7 +6,6 @@
 package control
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -17,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/daeuniverse/dae/common/consts"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 )
@@ -70,12 +68,12 @@ type DNSListener struct {
 	tcpServer  *dnsmessage.Server
 	udpServer  *dnsmessage.Server
 	endpoint   Endpoint
-	controller *ControlPlane
+	controller *DnsController
 	mu         sync.Mutex
 }
 
 // NewDNSListener creates a new DNS listener
-func NewDNSListener(log *logrus.Logger, endpoint string, controller *ControlPlane) (*DNSListener, error) {
+func NewDNSListener(log *logrus.Logger, endpoint string, controller *DnsController) (*DNSListener, error) {
 	e, err := ParseEndpoint(endpoint)
 	if err != nil {
 		return nil, err
@@ -227,7 +225,7 @@ func isExpectedDNSListenerClose(err error) bool {
 
 // dnsHandler implements the dns.Handler interface
 type dnsHandler struct {
-	controller *ControlPlane
+	controller *DnsController
 	log        *logrus.Logger
 }
 
@@ -290,30 +288,7 @@ func (h *dnsHandler) ServeDNS(w dnsmessage.ResponseWriter, r *dnsmessage.Msg) {
 		return
 	}
 
-	// Create routing result (fake)
-	routingResult := &bpfRoutingResult{
-		Outbound: uint8(consts.OutboundControlPlaneRouting),
-		Mark:     0,
-		Must:     0,
-		Mac:      [6]uint8{},
-		Pname:    [16]uint8{},
-		Pid:      0,
-		Dscp:     0,
-	}
-
-	// Handle the DNS request using the existing DNS controller
-	reqCtx, cancel := context.WithCancel(contextOrBackground(h.controller.ctx))
-	defer cancel()
-	udpReq := &udpRequest{
-		ctx:           reqCtx,
-		realSrc:       clientIPPort,
-		realDst:       localIPPort,
-		src:           clientIPPort,
-		lConn:         nil, // Not used in this context
-		routingResult: routingResult,
-	}
-
-	err = h.controller.dnsController.HandleWithResponseWriter_(r, udpReq, w)
+	err = h.controller.HandleLocalRequestWithResponseWriter(r, clientIPPort, localIPPort, w)
 	if err != nil {
 		h.log.Errorf("Failed to handle DNS request: %v", err)
 		// Send error response

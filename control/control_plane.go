@@ -91,8 +91,7 @@ type ControlPlane struct {
 	outbounds     []*outbound.DialerGroup
 	inConnections sync.Map
 
-	dnsController    *DnsController
-	dnsListener      *DNSListener
+	dns              *dnsService
 	onceNetworkReady sync.Once
 
 	dialMode consts.DialMode
@@ -514,7 +513,7 @@ func NewControlPlane(
 		deferFuncs:        deferFuncs,
 		listenIp:          "0.0.0.0",
 		outbounds:         outbounds,
-		dnsController:     nil,
+		dns:               nil,
 		onceNetworkReady:  sync.Once{},
 		dialMode:          dialMode,
 		routingMatcher:    routingMatcher,
@@ -541,10 +540,15 @@ func NewControlPlane(
 	}()
 
 	/// DNS upstream.
+	requestQTypePrefer, err := parseIpVersionPreference(dnsConfig.IpVersionPrefer)
+	if err != nil {
+		return nil, err
+	}
 	dnsUpstream, err := dns.New(dnsConfig, &dns.NewOption{
 		Logger:                  log,
 		LocationFinder:          locationFinder,
 		UpstreamReadyCallback:   plane.dnsUpstreamReadyCallback,
+		RequestQTypePrefer:      requestQTypePrefer,
 		UpstreamResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae, global.Mptcp),
 		ResolverDialer:          runtimeDeps.ResolverDialer,
 		ResolverDNS:             runtimeDeps.ResolverDNS,
@@ -557,63 +561,22 @@ func NewControlPlane(
 	if err != nil {
 		return nil, err
 	}
-	if plane.dnsController, err = NewDnsController(dnsUpstream, &DnsControllerOption{
-		Log:         log,
-		AnyfromPool: plane.anyfromPool,
-		CacheAccessCallback: func(cache *DnsCache) (err error) {
-			// Write mappings into eBPF map:
-			// IP record (from dns lookup) -> domain routing
-			if err = core.BatchUpdateDomainRouting(cache); err != nil {
-				return fmt.Errorf("BatchUpdateDomainRouting: %w", err)
-			}
-			return nil
-		},
-		CacheRemoveCallback: func(cache *DnsCache) (err error) {
-			// Write mappings into eBPF map:
-			// IP record (from dns lookup) -> domain routing
-			if err = core.BatchRemoveDomainRouting(cache); err != nil {
-				return fmt.Errorf("BatchUpdateDomainRouting: %w", err)
-			}
-			return nil
-		},
-		NewCache: func(fqdn string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error) {
-			ips, hasAnyIP := summarizeDNSAnswers(answers)
-			return &DnsCache{
-				DomainBitmap:     plane.routingMatcher.domainMatcher.MatchDomainBitmap(fqdn),
-				Answer:           answers,
-				IPs:              ips,
-				HasAnyIP:         hasAnyIP,
-				Deadline:         deadline,
-				OriginalDeadline: originalDeadline,
-			}, nil
-		},
-		BestDialerChooser: plane.chooseBestDnsDialer,
-		TimeoutExceedCallback: func(dialArgument *dialArgument, err error) {
-			dialArgument.bestDialer.ReportUnavailable(&dialer.NetworkType{
-				L4Proto:   dialArgument.l4proto,
-				IpVersion: dialArgument.ipversion,
-				IsDns:     true,
-			}, err)
-		},
-		IpVersionPrefer: dnsConfig.IpVersionPrefer,
-		FixedDomainTtl:  fixedDomainTtl,
-	}); err != nil {
+	controller, err := NewDnsController(dnsUpstream, plane.newDnsControllerOption(fixedDomainTtl))
+	if err != nil {
 		return nil, err
 	}
-	deferFuncs = append(deferFuncs, plane.dnsController.Close)
+	plane.dns, err = newDNSService(log, dnsConfig.Bind, controller)
+	if err != nil {
+		return nil, err
+	}
+	deferFuncs = append(deferFuncs, plane.dns.Close)
 
 	// Create and start DNS listener if configured
 	if dnsConfig.Bind != "" {
-		plane.dnsListener, err = NewDNSListener(log, dnsConfig.Bind, plane)
-		if err != nil {
-			return nil, err
-		}
-		if err = plane.dnsListener.Start(); err != nil {
+		if err = plane.dns.StartListener(); err != nil {
 			log.Errorf("Failed to start DNS listener: %v", err)
 		} else {
 			log.Infof("DNS listener started on %s", dnsConfig.Bind)
-			// Add DNS listener stop to defer functions
-			deferFuncs = append(deferFuncs, plane.dnsListener.Stop)
 		}
 	}
 	// Refresh domain routing cache with new routing.
@@ -627,29 +590,7 @@ func NewControlPlane(
 		}
 	}
 	if len(dnsCache) > 0 {
-		for cacheKey, cache := range dnsCache {
-			lastDot := strings.LastIndex(cacheKey, ".")
-			if lastDot == -1 || lastDot == len(cacheKey)-1 {
-				log.Warnln("Invalid cache key:", cacheKey)
-				continue
-			}
-			host := cacheKey[:lastDot]
-			_typ := cacheKey[lastDot+1:]
-			typ, err := strconv.ParseUint(_typ, 10, 16)
-			if err != nil {
-				log.WithError(err).Warnln("Invalid cache qtype:", cacheKey)
-				continue
-			}
-			answers := cache.AnswersForHostQType(host, uint16(typ))
-			if len(answers) == 0 {
-				continue
-			}
-			if err := plane.dnsController.__updateDnsCacheDeadline(host, uint16(typ), answers, func(_ time.Time, _ string) (time.Time, time.Time) {
-				return cache.Deadline, cache.OriginalDeadline
-			}); err != nil {
-				log.WithError(err).Warnf("Failed to restore DNS cache for %s", host)
-			}
-		}
+		plane.dns.RestoreCacheSnapshot(dnsCache)
 	}
 
 	// Init immediately to avoid DNS leaking in the very beginning because param control_plane_dns_routing will
@@ -675,6 +616,77 @@ func ParseFixedDomainTtl(ks []config.KeyableString) (map[string]int, error) {
 		m[strings.TrimSpace(key)] = int(ttl)
 	}
 	return m, nil
+}
+
+func (c *ControlPlane) newDnsControllerOption(fixedDomainTtl map[string]int) *DnsControllerOption {
+	return &DnsControllerOption{
+		Log:                   c.log,
+		AnyfromPool:           c.anyfromPool,
+		CacheAccessCallback:   c.onDnsCacheAccess,
+		CacheRemoveCallback:   c.onDnsCacheRemove,
+		NewCache:              c.newDnsCacheEntry,
+		BestDialerChooser:     c.chooseBestDnsDialer,
+		TimeoutExceedCallback: c.onDnsDialTimeout,
+		FixedDomainTtl:        fixedDomainTtl,
+	}
+}
+
+func (c *ControlPlane) onDnsCacheAccess(cache *DnsCache) error {
+	if c.core == nil {
+		return nil
+	}
+	if err := c.core.BatchUpdateDomainRouting(cache); err != nil {
+		return fmt.Errorf("BatchUpdateDomainRouting: %w", err)
+	}
+	return nil
+}
+
+func (c *ControlPlane) onDnsCacheRemove(cache *DnsCache) error {
+	if c.core == nil {
+		return nil
+	}
+	if err := c.core.BatchRemoveDomainRouting(cache); err != nil {
+		return fmt.Errorf("BatchRemoveDomainRouting: %w", err)
+	}
+	return nil
+}
+
+func (c *ControlPlane) newDnsCacheEntry(
+	fqdn string,
+	answers []dnsmessage.RR,
+	deadline time.Time,
+	originalDeadline time.Time,
+) (*DnsCache, error) {
+	ips, hasAnyIP := summarizeDNSAnswers(answers)
+	var (
+		domainBitmap []uint32
+		err          error
+	)
+	if c.routingMatcher != nil {
+		domainBitmap, err = c.routingMatcher.MatchDomainBitmap(fqdn)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &DnsCache{
+		DomainBitmap:     domainBitmap,
+		Answer:           answers,
+		IPs:              ips,
+		HasAnyIP:         hasAnyIP,
+		Deadline:         deadline,
+		OriginalDeadline: originalDeadline,
+	}, nil
+}
+
+func (c *ControlPlane) onDnsDialTimeout(dialArgument *dialArgument, err error) {
+	if dialArgument == nil || dialArgument.bestDialer == nil {
+		return
+	}
+	dialArgument.bestDialer.ReportUnavailable(&dialer.NetworkType{
+		L4Proto:   dialArgument.l4proto,
+		IpVersion: dialArgument.ipversion,
+		IsDns:     true,
+	}, err)
 }
 
 func ParseGroupOverrideOption(group config.Group, global config.Global, log *logrus.Logger) (*dialer.GlobalOption, error) {
@@ -717,14 +729,10 @@ func (c *ControlPlane) InjectBpf(bpf *bpfObjects) {
 }
 
 func (c *ControlPlane) SnapshotDnsCache() map[string]*DnsCache {
-	c.dnsController.dnsCacheMu.RLock()
-	defer c.dnsController.dnsCacheMu.RUnlock()
-
-	snapshot := make(map[string]*DnsCache, len(c.dnsController.dnsCache))
-	for key, cache := range c.dnsController.dnsCache {
-		snapshot[key] = cache.Clone()
+	if c.dns == nil {
+		return nil
 	}
-	return snapshot
+	return c.dns.SnapshotCache()
 }
 
 func (c *ControlPlane) dnsUpstreamReadyCallback(dnsUpstream *dns.Upstream) (err error) {
@@ -750,40 +758,7 @@ func (c *ControlPlane) dnsUpstreamReadyCallback(dnsUpstream *dns.Upstream) (err 
 	/// Updates dns cache to support domain routing for hostname of dns_upstream.
 	// Ten years later.
 	deadline := time.Now().Add(time.Hour * 24 * 365 * 10)
-	fqdn := dnsmessage.CanonicalName(dnsUpstream.Hostname)
-
-	if dnsUpstream.Ip4.IsValid() {
-		typ := dnsmessage.TypeA
-		answers := []dnsmessage.RR{&dnsmessage.A{
-			Hdr: dnsmessage.RR_Header{
-				Name:   dnsmessage.CanonicalName(fqdn),
-				Rrtype: typ,
-				Class:  dnsmessage.ClassINET,
-				Ttl:    0, // Must be zero.
-			},
-			A: dnsUpstream.Ip4.AsSlice(),
-		}}
-		if err = c.dnsController.UpdateDnsCacheDeadline(dnsUpstream.Hostname, typ, answers, deadline); err != nil {
-			return err
-		}
-	}
-
-	if dnsUpstream.Ip6.IsValid() {
-		typ := dnsmessage.TypeAAAA
-		answers := []dnsmessage.RR{&dnsmessage.AAAA{
-			Hdr: dnsmessage.RR_Header{
-				Name:   dnsmessage.CanonicalName(fqdn),
-				Rrtype: typ,
-				Class:  dnsmessage.ClassINET,
-				Ttl:    0, // Must be zero.
-			},
-			AAAA: dnsUpstream.Ip6.AsSlice(),
-		}}
-		if err = c.dnsController.UpdateDnsCacheDeadline(dnsUpstream.Hostname, typ, answers, deadline); err != nil {
-			return err
-		}
-	}
-	return nil
+	return c.dns.PrimeUpstreamAddressCache(dnsUpstream, deadline)
 }
 
 func (c *ControlPlane) ActivateCheck() {
@@ -814,6 +789,24 @@ func (c *ControlPlane) cachedRealDomainVerdict(domain string, now time.Time) (is
 	return entry.isReal, entry.shouldReroute, true
 }
 
+func joinHostPortString(host string, port uint16) string {
+	extra := 1 // :
+	if strings.IndexByte(host, ':') >= 0 {
+		extra += 2 // []
+	}
+	buf := make([]byte, 0, len(host)+extra+5)
+	if strings.IndexByte(host, ':') >= 0 {
+		buf = append(buf, '[')
+		buf = append(buf, host...)
+		buf = append(buf, ']')
+	} else {
+		buf = append(buf, host...)
+	}
+	buf = append(buf, ':')
+	buf = strconv.AppendUint(buf, uint64(port), 10)
+	return string(buf)
+}
+
 func (c *ControlPlane) rememberRealDomainVerdict(domain string, isReal bool, shouldReroute bool, ttl time.Duration) {
 	c.muRealDomainCache.Lock()
 	defer c.muRealDomainCache.Unlock()
@@ -834,7 +827,7 @@ func (c *ControlPlane) ChooseDialTarget(ctx context.Context, src netip.AddrPort,
 	} else if !outbound.IsReserved() && domain != "" {
 		switch c.dialMode {
 		case consts.DialMode_Domain:
-			if cache := c.dnsController.LookupDnsRespCache(c.dnsController.cacheKey(domain, common.AddrToDnsType(dst.Addr())), true); cache != nil {
+			if c.dns.HasCachedDomainAddress(domain, dst.Addr()) {
 				// Has A/AAAA records. It is a real domain.
 				dialMode = consts.DialMode_Domain
 			} else if isReal, cachedShouldReroute, ok := c.cachedRealDomainVerdict(domain, time.Now()); ok {
@@ -845,15 +838,7 @@ func (c *ControlPlane) ChooseDialTarget(ctx context.Context, src netip.AddrPort,
 			} else {
 				resolveCtx, cancel := context.WithTimeout(contextOrBackground(ctx), 5*time.Second)
 				defer cancel()
-				req := &udpRequest{
-					ctx:           resolveCtx,
-					realSrc:       src,
-					realDst:       dst,
-					src:           src,
-					lConn:         nil,
-					routingResult: routingResult,
-				}
-				if ip46, _, _ := c.dnsController.ResolveIp46(resolveCtx, req, domain); ip46.Ip4.IsValid() || ip46.Ip6.IsValid() {
+				if c.dns.DomainHasAnyResolvedIPForPacket(resolveCtx, src, dst, src, routingResult, domain) {
 					// Has A/AAAA records. It is a real domain.
 					dialMode = consts.DialMode_Domain
 					// Should use this domain to reroute
@@ -881,21 +866,25 @@ func (c *ControlPlane) ChooseDialTarget(ctx context.Context, src netip.AddrPort,
 			// Sniffed domain may be like `[2606:4700:20::681a:d1f]`. We should remove the brackets.
 			domain = domain[1 : len(domain)-1]
 		}
-		if _, err := netip.ParseAddr(domain); err == nil {
+		if strings.IndexByte(domain, ':') == -1 {
+			dialTarget = joinHostPortString(domain, dst.Port())
+		} else if _, err := netip.ParseAddr(domain); err == nil {
 			// domain is IPv4 or IPv6 (has colon)
-			dialTarget = net.JoinHostPort(domain, strconv.Itoa(int(dst.Port())))
+			dialTarget = joinHostPortString(domain, dst.Port())
 			dialIp = true
 
 		} else if _, _, err := net.SplitHostPort(domain); err == nil {
 			// domain is already domain:port
 			dialTarget = domain
 		} else {
-			dialTarget = net.JoinHostPort(domain, strconv.Itoa(int(dst.Port())))
+			dialTarget = joinHostPortString(domain, dst.Port())
 		}
-		c.log.WithFields(logrus.Fields{
-			"from": dst.String(),
-			"to":   dialTarget,
-		}).Debugln("Rewrite dial target to domain")
+		if c.log.IsLevelEnabled(logrus.DebugLevel) {
+			c.log.WithFields(logrus.Fields{
+				"from": dst.String(),
+				"to":   dialTarget,
+			}).Debugln("Rewrite dial target to domain")
+		}
 	}
 	return dialTarget, shouldReroute, dialIp
 }
@@ -1246,8 +1235,8 @@ func (c *ControlPlane) CacheStats() CacheStats {
 	if c.anyfromPool != nil {
 		stats.AnyfromPoolEntries = c.anyfromPool.Count()
 	}
-	if c.dnsController != nil {
-		dnsCacheEntries, dnsForwarderEntries := c.dnsController.CacheStats()
+	if c.dns != nil {
+		dnsCacheEntries, dnsForwarderEntries := c.dns.CacheStats()
 		stats.DnsCacheEntries = dnsCacheEntries
 		stats.DnsForwarderCacheEntries = dnsForwarderEntries
 	}
@@ -1306,6 +1295,9 @@ func (c *ControlPlane) Close() (err error) {
 	}
 	if c.core != nil {
 		err = errors.Join(err, c.core.Close())
+	}
+	if c.routingMatcher != nil {
+		c.routingMatcher.Close()
 	}
 	return err
 }
@@ -1369,16 +1361,16 @@ func preferNodeLatencySnapshot(next NodeLatencySnapshot, current NodeLatencySnap
 
 // StopDNSListener stops the DNS listener if it's running
 func (c *ControlPlane) StopDNSListener() error {
-	if c.dnsListener != nil {
-		return c.dnsListener.Stop()
+	if c.dns != nil {
+		return c.dns.StopListener()
 	}
 	return nil
 }
 
 // StartDNSListener restarts the DNS listener if it exists on this control plane.
 func (c *ControlPlane) StartDNSListener() error {
-	if c.dnsListener != nil {
-		return c.dnsListener.Start()
+	if c.dns != nil {
+		return c.dns.StartListener()
 	}
 	return nil
 }

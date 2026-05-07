@@ -8,6 +8,7 @@ package dns
 import (
 	"fmt"
 	"strconv"
+	"sync"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/routing"
@@ -131,14 +132,22 @@ func (b *RequestMatcherBuilder) addFallback(fallbackOutbound config.FunctionOrSt
 
 func (b *RequestMatcherBuilder) Build() (matcher *RequestMatcher, err error) {
 	var m RequestMatcher
+	m.rustMatcher, err = newRequestMatcherRuntime(consts.MaxMatchSetLen, b.simulatedDomainSet, b.rules)
+	if err != nil {
+		return nil, err
+	}
+	if m.rustMatcher != nil {
+		return &m, nil
+	}
 	// Build domainMatcher
-	m.domainMatcher = domain_matcher.NewAhocorasickSlimtrie(b.log, consts.MaxMatchSetLen)
+	m.domainMatcher = domain_matcher.NewDefaultDomainMatcher(b.log, consts.MaxMatchSetLen)
 	for _, domains := range b.simulatedDomainSet {
 		m.domainMatcher.AddSet(domains.RuleIndex, domains.Domains, domains.Key)
 	}
 	if err = m.domainMatcher.Build(); err != nil {
 		return nil, err
 	}
+	m.domainBitmapPool = routing.NewDomainBitmapPool(m.domainMatcher, consts.MaxMatchSetLen)
 
 	// Write routings.
 	// Fallback rule MUST be the last.
@@ -151,9 +160,32 @@ func (b *RequestMatcherBuilder) Build() (matcher *RequestMatcher, err error) {
 }
 
 type RequestMatcher struct {
-	domainMatcher routing.DomainMatcher // All domain matchSets use one DomainMatcher.
+	mu               sync.RWMutex
+	closed           bool
+	rustMatcher      *rustDnsRequestMatcherRuntime
+	domainMatcher    routing.DomainMatcher // All domain matchSets use one DomainMatcher.
+	domainBitmapPool *sync.Pool
 
 	matches []requestMatchSet
+}
+
+func (m *RequestMatcher) Close() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return
+	}
+	m.closed = true
+	if m.rustMatcher != nil {
+		m.rustMatcher.Close()
+		return
+	}
+	if closer, ok := m.domainMatcher.(routing.DomainMatcherCloser); ok {
+		closer.Close()
+	}
 }
 
 type requestMatchSet struct {
@@ -167,9 +199,24 @@ func (m *RequestMatcher) Match(
 	qName string,
 	qType uint16,
 ) (upstreamIndex consts.DnsRequestOutboundIndex, err error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return 0, fmt.Errorf("dns request matcher is closed")
+	}
+	if m.rustMatcher != nil {
+		return m.rustMatcher.Match(qName, qType)
+	}
 	var domainMatchBitmap []uint32
 	if qName != "" {
-		domainMatchBitmap = m.domainMatcher.MatchDomainBitmap(qName)
+		var domainBitmapBuffer *routing.DomainBitmapBuffer
+		domainMatchBitmap, domainBitmapBuffer, err = routing.MatchDomainBitmapWithPool(m.domainMatcher, m.domainBitmapPool, qName)
+		if err != nil {
+			return 0, fmt.Errorf("match domain bitmap: %w", err)
+		}
+		if domainBitmapBuffer != nil {
+			defer routing.PutDomainBitmap(m.domainBitmapPool, domainBitmapBuffer)
+		}
 	}
 
 	goodSubrule := false

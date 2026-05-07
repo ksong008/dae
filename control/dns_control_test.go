@@ -21,6 +21,7 @@ import (
 	componentdns "github.com/daeuniverse/dae/component/dns"
 	outbounddialer "github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/config"
+	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/daeuniverse/outbound/netproxy"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
@@ -48,6 +49,29 @@ func (f *fakeDnsForwarder) ForwardDNS(ctx context.Context, data []byte) (*dnsmes
 
 func (f *fakeDnsForwarder) Close() error {
 	f.closeCount++
+	return nil
+}
+
+type capturingDNSResponseWriter struct {
+	lastMsg *dnsmessage.Msg
+}
+
+func (w *capturingDNSResponseWriter) LocalAddr() net.Addr  { return nil }
+func (w *capturingDNSResponseWriter) RemoteAddr() net.Addr { return nil }
+func (w *capturingDNSResponseWriter) Write([]byte) (int, error) {
+	return 0, nil
+}
+func (w *capturingDNSResponseWriter) Close() error        { return nil }
+func (w *capturingDNSResponseWriter) TsigStatus() error   { return nil }
+func (w *capturingDNSResponseWriter) TsigTimersOnly(bool) {}
+func (w *capturingDNSResponseWriter) Hijack()             {}
+
+func (w *capturingDNSResponseWriter) WriteMsg(msg *dnsmessage.Msg) error {
+	if msg == nil {
+		w.lastMsg = nil
+		return nil
+	}
+	w.lastMsg = msg.Copy()
 	return nil
 }
 
@@ -147,6 +171,18 @@ func newTestARecord(qname, ip string) *dnsmessage.A {
 	}
 }
 
+func newTestAAAARecord(qname, ip string) *dnsmessage.AAAA {
+	return &dnsmessage.AAAA{
+		Hdr: dnsmessage.RR_Header{
+			Name:   dnsmessage.CanonicalName(qname),
+			Rrtype: dnsmessage.TypeAAAA,
+			Class:  dnsmessage.ClassINET,
+			Ttl:    60,
+		},
+		AAAA: net.ParseIP(ip).To16(),
+	}
+}
+
 func TestDNSForwarderReusable(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -240,10 +276,10 @@ func TestLookupDnsRespCacheRemovesExpiredEntry(t *testing.T) {
 	}
 
 	cacheKey := controller.cacheKey("example.com.", dnsmessage.TypeA)
-	controller.dnsCache[cacheKey] = &DnsCache{
+	controller.runtime.Cache().Insert(cacheKey, &DnsCache{
 		Deadline:         time.Now().Add(-time.Second),
 		OriginalDeadline: time.Now().Add(-time.Second),
-	}
+	})
 
 	cache := controller.LookupDnsRespCache(cacheKey, false)
 	if cache != nil {
@@ -252,7 +288,7 @@ func TestLookupDnsRespCacheRemovesExpiredEntry(t *testing.T) {
 	if removed != 1 {
 		t.Fatalf("expected 1 cache removal callback, got %d", removed)
 	}
-	if _, ok := controller.dnsCache[cacheKey]; ok {
+	if controller.runtime.Cache().Has(cacheKey) {
 		t.Fatal("expected expired cache entry to be removed from cache map")
 	}
 }
@@ -286,14 +322,14 @@ func TestLookupDnsRespCacheTracksHitAndExpiredRemovalCounters(t *testing.T) {
 
 	liveKey := controller.cacheKey("live.example.", dnsmessage.TypeA)
 	expiredKey := controller.cacheKey("expired.example.", dnsmessage.TypeA)
-	controller.dnsCache[liveKey] = &DnsCache{
+	controller.runtime.Cache().Insert(liveKey, &DnsCache{
 		Deadline:         now.Add(time.Minute),
 		OriginalDeadline: now.Add(time.Minute),
-	}
-	controller.dnsCache[expiredKey] = &DnsCache{
+	})
+	controller.runtime.Cache().Insert(expiredKey, &DnsCache{
 		Deadline:         now.Add(-time.Minute),
 		OriginalDeadline: now.Add(-time.Minute),
-	}
+	})
 
 	before := snapshotDnsObservabilityStats()
 	if cache := controller.LookupDnsRespCache(liveKey, false); cache == nil {
@@ -394,16 +430,16 @@ func TestSweepDnsCacheUsesLatestDeadline(t *testing.T) {
 
 	now := time.Now()
 	cacheKey := controller.cacheKey("example.com.", dnsmessage.TypeA)
-	controller.dnsCache[cacheKey] = &DnsCache{
+	controller.runtime.Cache().Insert(cacheKey, &DnsCache{
 		Deadline:         now.Add(-time.Minute),
 		OriginalDeadline: now.Add(time.Minute),
-	}
+	})
 
 	controller.sweepDnsCache(now)
 	if removed != 0 {
 		t.Fatalf("expected no removal while original deadline is still valid, got %d", removed)
 	}
-	if _, ok := controller.dnsCache[cacheKey]; !ok {
+	if !controller.runtime.Cache().Has(cacheKey) {
 		t.Fatal("expected cache entry to remain while latest deadline is valid")
 	}
 
@@ -411,7 +447,7 @@ func TestSweepDnsCacheUsesLatestDeadline(t *testing.T) {
 	if removed != 1 {
 		t.Fatalf("expected one removal after both deadlines expired, got %d", removed)
 	}
-	if _, ok := controller.dnsCache[cacheKey]; ok {
+	if controller.runtime.Cache().Has(cacheKey) {
 		t.Fatal("expected cache entry to be removed after expiry")
 	}
 }
@@ -446,14 +482,14 @@ func TestCacheStatsCountsOnlyLiveDnsEntriesWithoutMutation(t *testing.T) {
 	controller.now = func() time.Time { return now }
 	expiredKey := controller.cacheKey("expired.example.", dnsmessage.TypeA)
 	liveKey := controller.cacheKey("live.example.", dnsmessage.TypeA)
-	controller.dnsCache[expiredKey] = &DnsCache{
+	controller.runtime.Cache().Insert(expiredKey, &DnsCache{
 		Deadline:         now.Add(-time.Minute),
 		OriginalDeadline: now.Add(-time.Minute),
-	}
-	controller.dnsCache[liveKey] = &DnsCache{
+	})
+	controller.runtime.Cache().Insert(liveKey, &DnsCache{
 		Deadline:         now.Add(-time.Minute),
 		OriginalDeadline: now.Add(time.Minute),
-	}
+	})
 
 	dnsCacheEntries, dnsForwarderEntries := controller.CacheStats()
 	if dnsCacheEntries != 1 {
@@ -465,13 +501,13 @@ func TestCacheStatsCountsOnlyLiveDnsEntriesWithoutMutation(t *testing.T) {
 	if removed != 0 {
 		t.Fatalf("expected CacheStats not to invoke cacheRemoveCallback, got %d calls", removed)
 	}
-	if len(controller.dnsCache) != 2 {
-		t.Fatalf("expected CacheStats not to mutate dns cache map, got len=%d", len(controller.dnsCache))
+	if controller.runtime.Cache().Len() != 2 {
+		t.Fatalf("expected CacheStats not to mutate dns cache map, got len=%d", controller.runtime.Cache().Len())
 	}
-	if _, ok := controller.dnsCache[expiredKey]; !ok {
+	if !controller.runtime.Cache().Has(expiredKey) {
 		t.Fatal("expected expired cache entry to remain for normal cleanup path")
 	}
-	if _, ok := controller.dnsCache[liveKey]; !ok {
+	if !controller.runtime.Cache().Has(liveKey) {
 		t.Fatal("expected live cache entry to remain")
 	}
 }
@@ -496,14 +532,21 @@ func TestDoUDPForwardDNSTracksRetryCounter(t *testing.T) {
 		&outbounddialer.Property{},
 	)
 
-	forwarder := &DoUDP{
-		Upstream: componentdns.Upstream{
-			Scheme: componentdns.UpstreamScheme_UDP,
+	forwarder, err := componentdns.NewForwarder(&componentdns.Upstream{
+		Scheme: componentdns.UpstreamScheme_UDP,
+	}, componentdns.ForwarderPath{
+		Dialer:     bestDialer,
+		BestTarget: netip.MustParseAddrPort("1.1.1.1:53"),
+		Mark:       0,
+		MPTCP:      false,
+		L4Proto:    consts.L4ProtoStr_UDP,
+	}, componentdns.ForwarderHooks{
+		OnUDPRetry: func() {
+			recordDnsUDPRetry()
 		},
-		dialArgument: dialArgument{
-			bestDialer: bestDialer,
-			bestTarget: netip.MustParseAddrPort("1.1.1.1:53"),
-		},
+	})
+	if err != nil {
+		t.Fatalf("NewForwarder() error = %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -679,8 +722,8 @@ func TestNormalizeAndCacheDnsRespSkipsEmptySuccess(t *testing.T) {
 	if err := controller.NormalizeAndCacheDnsResp_(msg); err != nil {
 		t.Fatal(err)
 	}
-	if len(controller.dnsCache) != 0 {
-		t.Fatalf("expected empty success response not to be cached, got %d entries", len(controller.dnsCache))
+	if controller.runtime.Cache().Len() != 0 {
+		t.Fatalf("expected empty success response not to be cached, got %d entries", controller.runtime.Cache().Len())
 	}
 }
 
@@ -768,6 +811,115 @@ func TestUpdateDnsCacheDeadlineIgnoresFixedDomainTTL(t *testing.T) {
 	}
 }
 
+func TestRestoreCacheSnapshotRestoresValidEntries(t *testing.T) {
+	now := time.Now()
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log:                 logrus.New(),
+		CacheAccessCallback: func(*DnsCache) error { return nil },
+		CacheRemoveCallback: func(*DnsCache) error { return nil },
+		NewCache: func(_ string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (*DnsCache, error) {
+			return &DnsCache{Answer: answers, Deadline: deadline, OriginalDeadline: originalDeadline}, nil
+		},
+		BestDialerChooser:     func(*udpRequest, *componentdns.Upstream) (*dialArgument, error) { return nil, nil },
+		TimeoutExceedCallback: func(*dialArgument, error) {},
+	})
+	if err != nil {
+		t.Fatalf("NewDnsController() returned error: %v", err)
+	}
+
+	controller.RestoreCacheSnapshot(map[string]*DnsCache{
+		"example.com.1": {
+			Answer:           []dnsmessage.RR{newTestARecord("example.com.", "1.1.1.1")},
+			Deadline:         now.Add(time.Minute),
+			OriginalDeadline: now.Add(2 * time.Minute),
+		},
+		"bad-cache-key": {
+			Answer:           []dnsmessage.RR{newTestARecord("bad-cache-key.", "2.2.2.2")},
+			Deadline:         now.Add(time.Minute),
+			OriginalDeadline: now.Add(2 * time.Minute),
+		},
+	})
+
+	cache := controller.LookupDnsRespCache(controller.cacheKey("example.com.", dnsmessage.TypeA), true)
+	if cache == nil {
+		t.Fatal("expected restored cache entry for example.com A")
+	}
+	msg := new(dnsmessage.Msg)
+	msg.SetQuestion("example.com.", dnsmessage.TypeA)
+	resp := controller.LookupDnsRespCache_(msg, controller.cacheKey("example.com.", dnsmessage.TypeA), true)
+	if resp == nil {
+		t.Fatal("expected restored cache to fill response message")
+	}
+	var restored dnsmessage.Msg
+	if err := restored.Unpack(resp); err != nil {
+		t.Fatalf("Unpack(restored response) error = %v", err)
+	}
+	if len(restored.Answer) != 1 {
+		t.Fatalf("expected one restored answer in packed response, got %d", len(restored.Answer))
+	}
+	if controller.LookupDnsRespCache("bad-cache-key", true) != nil {
+		t.Fatal("unexpected cache restoration for invalid cache key")
+	}
+}
+
+func TestPrimeUpstreamAddressCacheStoresAAndAAAA(t *testing.T) {
+	now := time.Now()
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log:                 logrus.New(),
+		CacheAccessCallback: func(*DnsCache) error { return nil },
+		CacheRemoveCallback: func(*DnsCache) error { return nil },
+		NewCache: func(_ string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (*DnsCache, error) {
+			return &DnsCache{Answer: answers, Deadline: deadline, OriginalDeadline: originalDeadline}, nil
+		},
+		BestDialerChooser:     func(*udpRequest, *componentdns.Upstream) (*dialArgument, error) { return nil, nil },
+		TimeoutExceedCallback: func(*dialArgument, error) {},
+	})
+	if err != nil {
+		t.Fatalf("NewDnsController() returned error: %v", err)
+	}
+
+	upstream := &componentdns.Upstream{
+		Hostname: "dns.example",
+		Ip46: &netutils.Ip46{
+			Ip4: netip.MustParseAddr("1.1.1.1"),
+			Ip6: netip.MustParseAddr("2001:db8::1"),
+		},
+	}
+	deadline := now.Add(24 * time.Hour)
+	if err := controller.PrimeUpstreamAddressCache(upstream, deadline); err != nil {
+		t.Fatalf("PrimeUpstreamAddressCache() error = %v", err)
+	}
+
+	cacheA := controller.LookupDnsRespCache(controller.cacheKey("dns.example", dnsmessage.TypeA), true)
+	if cacheA == nil {
+		t.Fatalf("expected A cache entry, got %#v", cacheA)
+	}
+	msgA := new(dnsmessage.Msg)
+	msgA.SetQuestion("dns.example.", dnsmessage.TypeA)
+	respA := controller.LookupDnsRespCache_(msgA, controller.cacheKey("dns.example", dnsmessage.TypeA), true)
+	if respA == nil {
+		t.Fatalf("expected A cache response, got msg=%#v resp=%v", msgA, respA)
+	}
+	var restoredA dnsmessage.Msg
+	if err := restoredA.Unpack(respA); err != nil || len(restoredA.Answer) != 1 {
+		t.Fatalf("expected unpacked A cache response, got msg=%#v err=%v", restoredA, err)
+	}
+	cacheAAAA := controller.LookupDnsRespCache(controller.cacheKey("dns.example", dnsmessage.TypeAAAA), true)
+	if cacheAAAA == nil {
+		t.Fatalf("expected AAAA cache entry, got %#v", cacheAAAA)
+	}
+	msgAAAA := new(dnsmessage.Msg)
+	msgAAAA.SetQuestion("dns.example.", dnsmessage.TypeAAAA)
+	respAAAA := controller.LookupDnsRespCache_(msgAAAA, controller.cacheKey("dns.example", dnsmessage.TypeAAAA), true)
+	if respAAAA == nil {
+		t.Fatalf("expected AAAA cache response, got msg=%#v resp=%v", msgAAAA, respAAAA)
+	}
+	var restoredAAAA dnsmessage.Msg
+	if err := restoredAAAA.Unpack(respAAAA); err != nil || len(restoredAAAA.Answer) != 1 {
+		t.Fatalf("expected unpacked AAAA cache response, got msg=%#v err=%v", restoredAAAA, err)
+	}
+}
+
 func TestUpdateDnsCacheEvictsOldestWhenCacheFull(t *testing.T) {
 	controller, err := NewDnsController(nil, &DnsControllerOption{
 		Log: logrus.New(),
@@ -793,22 +945,22 @@ func TestUpdateDnsCacheEvictsOldestWhenCacheFull(t *testing.T) {
 	now := time.Now()
 	for i := 0; i < dnsCacheMaxEntries; i++ {
 		key := controller.cacheKey(fmt.Sprintf("old-%d.example.", i), dnsmessage.TypeA)
-		controller.dnsCache[key] = &DnsCache{
+		controller.runtime.Cache().Insert(key, &DnsCache{
 			Deadline:         now.Add(time.Duration(i+1) * time.Second),
 			OriginalDeadline: now.Add(time.Duration(i+1) * time.Second),
-		}
+		})
 	}
 
 	if err := controller.UpdateDnsCacheDeadline("new.example", dnsmessage.TypeA, []dnsmessage.RR{}, now.Add(10*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if len(controller.dnsCache) != dnsCacheMaxEntries {
-		t.Fatalf("expected cache size to stay capped at %d, got %d", dnsCacheMaxEntries, len(controller.dnsCache))
+	if controller.runtime.Cache().Len() != dnsCacheMaxEntries {
+		t.Fatalf("expected cache size to stay capped at %d, got %d", dnsCacheMaxEntries, controller.runtime.Cache().Len())
 	}
-	if _, ok := controller.dnsCache[controller.cacheKey("old-0.example.", dnsmessage.TypeA)]; ok {
+	if controller.runtime.Cache().Has(controller.cacheKey("old-0.example.", dnsmessage.TypeA)) {
 		t.Fatal("expected oldest dns cache entry to be evicted")
 	}
-	if _, ok := controller.dnsCache[controller.cacheKey("new.example.", dnsmessage.TypeA)]; !ok {
+	if !controller.runtime.Cache().Has(controller.cacheKey("new.example.", dnsmessage.TypeA)) {
 		t.Fatal("expected new dns cache entry to be retained")
 	}
 }
@@ -834,14 +986,8 @@ func TestSweepDnsForwarderCacheRemovesIdleEntries(t *testing.T) {
 	now := time.Now()
 	stale := &fakeDnsForwarder{}
 	fresh := &fakeDnsForwarder{}
-	controller.dnsForwarderCache[dnsForwarderKey{upstream: "stale"}] = &cachedDnsForwarder{
-		forwarder: stale,
-		lastUsed:  now.Add(-dnsForwarderIdleTimeout - time.Second),
-	}
-	controller.dnsForwarderCache[dnsForwarderKey{upstream: "fresh"}] = &cachedDnsForwarder{
-		forwarder: fresh,
-		lastUsed:  now,
-	}
+	controller.runtime.Forwarders().Insert(dnsForwarderKey{upstream: "stale"}, stale, now.Add(-dnsForwarderIdleTimeout-time.Second), 0)
+	controller.runtime.Forwarders().Insert(dnsForwarderKey{upstream: "fresh"}, fresh, now, 0)
 
 	controller.sweepDnsForwarderCache(now, false)
 	if stale.closeCount != 1 {
@@ -850,10 +996,10 @@ func TestSweepDnsForwarderCacheRemovesIdleEntries(t *testing.T) {
 	if fresh.closeCount != 0 {
 		t.Fatalf("expected fresh forwarder to stay open, got %d closes", fresh.closeCount)
 	}
-	if _, ok := controller.dnsForwarderCache[dnsForwarderKey{upstream: "stale"}]; ok {
+	if controller.runtime.Forwarders().Has(dnsForwarderKey{upstream: "stale"}) {
 		t.Fatal("expected stale forwarder entry to be removed")
 	}
-	if _, ok := controller.dnsForwarderCache[dnsForwarderKey{upstream: "fresh"}]; !ok {
+	if !controller.runtime.Forwarders().Has(dnsForwarderKey{upstream: "fresh"}) {
 		t.Fatal("expected fresh forwarder entry to remain")
 	}
 }
@@ -890,13 +1036,10 @@ func TestGetDnsForwarderEvictsOldestWhenCacheFull(t *testing.T) {
 
 	for i := 0; i < dnsForwarderCacheMaxEntries; i++ {
 		key := dnsForwarderKey{upstream: fmt.Sprintf("upstream-%d", i)}
-		controller.dnsForwarderCache[key] = &cachedDnsForwarder{
-			forwarder: &fakeDnsForwarder{},
-			lastUsed:  now.Add(time.Duration(i-dnsForwarderCacheMaxEntries) * time.Second),
-		}
+		controller.runtime.Forwarders().Insert(key, &fakeDnsForwarder{}, now.Add(time.Duration(i-dnsForwarderCacheMaxEntries)*time.Second), 0)
 	}
 
-	forwarder, key, entry, reusable, err := controller.getDnsForwarder(&componentdns.Upstream{
+	forwarder, lease, reusable, err := controller.getDnsForwarder(&componentdns.Upstream{
 		Scheme:   componentdns.UpstreamScheme_HTTPS,
 		Hostname: "dns.example.com",
 		Port:     443,
@@ -918,10 +1061,10 @@ func TestGetDnsForwarderEvictsOldestWhenCacheFull(t *testing.T) {
 	if created != 1 {
 		t.Fatalf("expected one created forwarder, got %d", created)
 	}
-	if len(controller.dnsForwarderCache) != dnsForwarderCacheMaxEntries {
-		t.Fatalf("expected cache size to stay capped at %d, got %d", dnsForwarderCacheMaxEntries, len(controller.dnsForwarderCache))
+	if controller.runtime.Forwarders().Len() != dnsForwarderCacheMaxEntries {
+		t.Fatalf("expected cache size to stay capped at %d, got %d", dnsForwarderCacheMaxEntries, controller.runtime.Forwarders().Len())
 	}
-	if releaseErr := controller.releaseDnsForwarder(key, entry, forwarder, reusable, false); releaseErr != nil {
+	if releaseErr := controller.releaseDnsForwarder(lease, forwarder, reusable, false); releaseErr != nil {
 		t.Fatal(releaseErr)
 	}
 }
@@ -946,18 +1089,39 @@ func TestReleaseDnsForwarderRemovesFailedReusableEntry(t *testing.T) {
 	controller.now = func() time.Time { return now }
 
 	forwarder := &fakeDnsForwarder{}
-	key := dnsForwarderKey{upstream: "https://dns.example.com"}
-	entry := &cachedDnsForwarder{
-		forwarder: forwarder,
-		lastUsed:  now,
-		refs:      1,
+	dArg := &dialArgument{
+		l4proto:    consts.L4ProtoStr_TCP,
+		bestTarget: netip.MustParseAddrPort("1.1.1.1:443"),
 	}
-	controller.dnsForwarderCache[key] = entry
+	upstream := &componentdns.Upstream{
+		Scheme:   componentdns.UpstreamScheme_HTTPS,
+		Hostname: "dns.example.com",
+		Port:     443,
+		Ip46: &netutils.Ip46{
+			Ip4: netip.MustParseAddr("1.1.1.1"),
+		},
+	}
+	key := newDnsForwarderKey(upstream, *dArg)
+	controller.runtime.Forwarders().Insert(key, forwarder, now, 0)
+	_, lease, reusable, err := controller.runtime.Forwarders().GetForwarder(upstream, componentdns.SelectedForwarder[dnsForwarderKey, *dialArgument]{
+		Key: key,
+		Path: componentdns.ForwarderPath{
+			L4Proto:    consts.L4ProtoStr_TCP,
+			BestTarget: netip.MustParseAddrPort("1.1.1.1:443"),
+		},
+		Meta: dArg,
+	})
+	if err != nil {
+		t.Fatalf("GetForwarder() error = %v", err)
+	}
+	if !reusable {
+		t.Fatal("expected reusable forwarder")
+	}
 
-	if err := controller.releaseDnsForwarder(key, entry, forwarder, true, true); err != nil {
+	if err := controller.releaseDnsForwarder(lease, forwarder, true, true); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := controller.dnsForwarderCache[key]; ok {
+	if controller.runtime.Forwarders().Has(key) {
 		t.Fatal("expected failed reusable forwarder to be removed from cache")
 	}
 	if forwarder.closeCount != 1 {
@@ -984,14 +1148,10 @@ func TestSweepDnsForwarderCacheKeepsInUseEntry(t *testing.T) {
 	now := time.Now()
 	inUse := &fakeDnsForwarder{}
 	key := dnsForwarderKey{upstream: "in-use"}
-	controller.dnsForwarderCache[key] = &cachedDnsForwarder{
-		forwarder: inUse,
-		lastUsed:  now.Add(-dnsForwarderIdleTimeout - time.Second),
-		refs:      1,
-	}
+	controller.runtime.Forwarders().Insert(key, inUse, now.Add(-dnsForwarderIdleTimeout-time.Second), 1)
 
 	controller.sweepDnsForwarderCache(now, false)
-	if _, ok := controller.dnsForwarderCache[key]; !ok {
+	if !controller.runtime.Forwarders().Has(key) {
 		t.Fatal("expected in-use forwarder to stay cached during sweep")
 	}
 	if inUse.closeCount != 0 {
@@ -1069,7 +1229,7 @@ func TestDialSendUsesRequestContext(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = controller.dialSend(0, req, data, msg.Id, &componentdns.Upstream{
+	err = controller.dialSend(0, req, data, &componentdns.Upstream{
 		Scheme:   componentdns.UpstreamScheme_UDP,
 		Hostname: "1.1.1.1",
 		Port:     53,
@@ -1088,6 +1248,173 @@ func TestDialSendUsesRequestContext(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for forwarded context")
+	}
+}
+
+func BenchmarkGetDnsForwarderReusableHit(b *testing.B) {
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log:                 logrus.New(),
+		CacheAccessCallback: func(*DnsCache) error { return nil },
+		CacheRemoveCallback: func(*DnsCache) error { return nil },
+		NewCache: func(_ string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (*DnsCache, error) {
+			return &DnsCache{}, nil
+		},
+		BestDialerChooser:     func(*udpRequest, *componentdns.Upstream) (*dialArgument, error) { return nil, nil },
+		TimeoutExceedCallback: func(*dialArgument, error) {},
+	})
+	if err != nil {
+		b.Fatalf("NewDnsController() returned error: %v", err)
+	}
+	defer controller.Close()
+
+	controller.forwarderFactory = func(upstream *componentdns.Upstream, dialArgument dialArgument) (DnsForwarder, error) {
+		return &fakeDnsForwarder{}, nil
+	}
+
+	upstream := &componentdns.Upstream{
+		Scheme:   componentdns.UpstreamScheme_HTTPS,
+		Hostname: "dns.example.com",
+		Port:     443,
+		Index:    consts.DnsRequestOutboundIndex(1),
+		Ip46: &netutils.Ip46{
+			Ip4: netip.MustParseAddr("1.1.1.1"),
+		},
+	}
+	dialArg := &dialArgument{
+		l4proto:    consts.L4ProtoStr_TCP,
+		ipversion:  consts.IpVersionStr_4,
+		bestTarget: netip.MustParseAddrPort("1.1.1.1:443"),
+	}
+
+	forwarder, lease, reusable, err := controller.getDnsForwarder(upstream, dialArg)
+	if err != nil {
+		b.Fatalf("getDnsForwarder() warmup error = %v", err)
+	}
+	if err := controller.releaseDnsForwarder(lease, forwarder, reusable, false); err != nil {
+		b.Fatalf("releaseDnsForwarder() warmup error = %v", err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		forwarder, lease, reusable, err := controller.getDnsForwarder(upstream, dialArg)
+		if err != nil {
+			b.Fatalf("getDnsForwarder() error = %v", err)
+		}
+		if !reusable {
+			b.Fatal("expected reusable forwarder")
+		}
+		if err := controller.releaseDnsForwarder(lease, forwarder, reusable, false); err != nil {
+			b.Fatalf("releaseDnsForwarder() error = %v", err)
+		}
+	}
+}
+
+func TestHandleWithResponseWriterRejectsNonPreferredAWhenPreferredAAAAHasAnswer(t *testing.T) {
+	log := logrus.New()
+	log.SetLevel(logrus.ErrorLevel)
+
+	routing, err := componentdns.New(&config.Dns{
+		Upstream: []config.KeyableString{
+			"test:udp://1.1.1.1:53",
+		},
+		Routing: config.DnsRouting{
+			Request: config.DnsRequestRouting{
+				Fallback: "test",
+			},
+			Response: config.DnsResponseRouting{
+				Fallback: "accept",
+			},
+		},
+	}, &componentdns.NewOption{
+		Logger:             log,
+		RequestQTypePrefer: uint16(dnsmessage.TypeAAAA),
+		UpstreamReadyCallback: func(*componentdns.Upstream) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to build dns routing: %v", err)
+	}
+
+	controller, err := NewDnsController(routing, &DnsControllerOption{
+		Log:                 log,
+		CacheAccessCallback: func(*DnsCache) error { return nil },
+		CacheRemoveCallback: func(*DnsCache) error { return nil },
+		NewCache: func(_ string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (*DnsCache, error) {
+			ips, hasAnyIP := summarizeDNSAnswers(answers)
+			return &DnsCache{
+				Answer:           answers,
+				IPs:              ips,
+				HasAnyIP:         hasAnyIP,
+				Deadline:         deadline,
+				OriginalDeadline: originalDeadline,
+			}, nil
+		},
+		BestDialerChooser: func(*udpRequest, *componentdns.Upstream) (*dialArgument, error) {
+			return &dialArgument{
+				l4proto:   consts.L4ProtoStr_UDP,
+				ipversion: consts.IpVersionStr_6,
+			}, nil
+		},
+		TimeoutExceedCallback: func(*dialArgument, error) {},
+	})
+	if err != nil {
+		t.Fatalf("NewDnsController() returned error: %v", err)
+	}
+	defer controller.Close()
+
+	var seenQTypes []uint16
+	controller.forwarderFactory = func(_ *componentdns.Upstream, _ dialArgument) (DnsForwarder, error) {
+		return &fakeDnsForwarder{
+			forward: func(_ context.Context, data []byte) (*dnsmessage.Msg, error) {
+				req := new(dnsmessage.Msg)
+				if err := req.Unpack(data); err != nil {
+					return nil, err
+				}
+				q := req.Question[0]
+				seenQTypes = append(seenQTypes, q.Qtype)
+				switch q.Qtype {
+				case dnsmessage.TypeA:
+					resp := newTestDnsResponse("example.com.", dnsmessage.TypeA, newTestARecord("example.com.", "1.1.1.1"), false)
+					resp.Id = req.Id
+					return resp, nil
+				case dnsmessage.TypeAAAA:
+					resp := newTestDnsResponse("example.com.", dnsmessage.TypeAAAA, newTestAAAARecord("example.com.", "2001:db8::1"), false)
+					resp.Id = req.Id
+					return resp, nil
+				default:
+					return nil, fmt.Errorf("unexpected qtype: %d", q.Qtype)
+				}
+			},
+		}, nil
+	}
+
+	msg := new(dnsmessage.Msg)
+	msg.SetQuestion("example.com.", dnsmessage.TypeA)
+	writer := &capturingDNSResponseWriter{}
+	err = controller.HandleWithResponseWriter_(msg, &udpRequest{
+		ctx:           context.Background(),
+		realSrc:       netip.MustParseAddrPort("127.0.0.1:43210"),
+		realDst:       netip.MustParseAddrPort("127.0.0.1:53"),
+		src:           netip.MustParseAddrPort("127.0.0.1:43210"),
+		routingResult: &bpfRoutingResult{},
+	}, writer)
+	if err != nil {
+		t.Fatalf("HandleWithResponseWriter_() error = %v", err)
+	}
+	if len(seenQTypes) != 2 {
+		t.Fatalf("expected dual-stack plan to issue 2 upstream queries, got %v", seenQTypes)
+	}
+	if writer.lastMsg == nil {
+		t.Fatal("expected response writer to receive a DNS response")
+	}
+	if len(writer.lastMsg.Answer) != 0 {
+		t.Fatalf("expected preferred AAAA answer to reject A response, got answers=%v", writer.lastMsg.Answer)
+	}
+	cache := controller.LookupDnsRespCache(controller.cacheKey("example.com.", dnsmessage.TypeAAAA), true)
+	if cache == nil || !cache.IncludeIp(netip.MustParseAddr("2001:db8::1")) {
+		t.Fatalf("expected AAAA cache entry with preferred IP, got %+v", cache)
 	}
 }
 
@@ -1204,7 +1531,7 @@ func TestDialSendRetriesTruncatedTCPUDPResponseOverTCP(t *testing.T) {
 	requestID = msg.Id
 
 	before := snapshotDnsObservabilityStats()
-	err = controller.dialSend(0, req, data, msg.Id, &componentdns.Upstream{
+	err = controller.dialSend(0, req, data, &componentdns.Upstream{
 		Scheme:   componentdns.UpstreamScheme_TCP_UDP,
 		Hostname: "1.1.1.1",
 		Port:     53,
@@ -1229,10 +1556,10 @@ func TestDialSendRetriesTruncatedTCPUDPResponseOverTCP(t *testing.T) {
 		t.Fatal("expected DNS cache entry after successful fallback")
 	}
 	if !cache.IncludeIp(netip.MustParseAddr("2.2.2.2")) {
-		t.Fatalf("expected cache to contain TCP fallback answer, got %v", cache.cachedIPs())
+		t.Fatalf("expected cache to contain TCP fallback answer, got %v", cache.CachedIPs())
 	}
 	if cache.IncludeIp(netip.MustParseAddr("1.1.1.1")) {
-		t.Fatalf("expected truncated UDP answer to be replaced, got %v", cache.cachedIPs())
+		t.Fatalf("expected truncated UDP answer to be replaced, got %v", cache.CachedIPs())
 	}
 	if got := after.DnsTruncatedTcpFallbackTotal - before.DnsTruncatedTcpFallbackTotal; got != 1 {
 		t.Fatalf("expected one truncated TCP fallback to be recorded, got %d", got)
@@ -1326,7 +1653,7 @@ func TestDialSendDoesNotRetryTruncatedPureUDPResponseOverTCP(t *testing.T) {
 	requestID = msg.Id
 
 	before := snapshotDnsObservabilityStats()
-	err = controller.dialSend(0, req, data, msg.Id, &componentdns.Upstream{
+	err = controller.dialSend(0, req, data, &componentdns.Upstream{
 		Scheme:   componentdns.UpstreamScheme_UDP,
 		Hostname: "1.1.1.1",
 		Port:     53,
@@ -1347,6 +1674,145 @@ func TestDialSendDoesNotRetryTruncatedPureUDPResponseOverTCP(t *testing.T) {
 	}
 	if got := after.DnsTruncatedTcpFallbackTotal - before.DnsTruncatedTcpFallbackTotal; got != 0 {
 		t.Fatalf("expected no truncated TCP fallback to be recorded, got %d", got)
+	}
+}
+
+func TestDialSendRetriesResponseSelectedUpstream(t *testing.T) {
+	log := logrus.New()
+	log.SetLevel(logrus.ErrorLevel)
+
+	routing, err := componentdns.New(&config.Dns{
+		Upstream: []config.KeyableString{
+			"first:udp://1.1.1.1:53",
+			"second:udp://2.2.2.2:53",
+		},
+		Routing: config.DnsRouting{
+			Request: config.DnsRequestRouting{
+				Fallback: "first",
+			},
+			Response: config.DnsResponseRouting{
+				Rules: []*config_parser.RoutingRule{
+					{
+						AndFunctions: []*config_parser.Function{
+							{
+								Name: string(consts.Function_Upstream),
+								Params: []*config_parser.Param{
+									{Val: "first"},
+								},
+							},
+						},
+						Outbound: config_parser.Function{Name: "second"},
+					},
+				},
+				Fallback: "accept",
+			},
+		},
+	}, &componentdns.NewOption{
+		Logger: log,
+		UpstreamReadyCallback: func(*componentdns.Upstream) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to build dns routing: %v", err)
+	}
+
+	var forwardedHosts []string
+	controller, err := NewDnsController(routing, &DnsControllerOption{
+		Log:                 log,
+		CacheAccessCallback: func(*DnsCache) error { return nil },
+		CacheRemoveCallback: func(*DnsCache) error { return nil },
+		NewCache: func(_ string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (*DnsCache, error) {
+			ips, hasAnyIP := summarizeDNSAnswers(answers)
+			return &DnsCache{
+				Answer:           answers,
+				IPs:              ips,
+				HasAnyIP:         hasAnyIP,
+				Deadline:         deadline,
+				OriginalDeadline: originalDeadline,
+			}, nil
+		},
+		BestDialerChooser: func(_ *udpRequest, _ *componentdns.Upstream) (*dialArgument, error) {
+			return &dialArgument{
+				l4proto:   consts.L4ProtoStr_UDP,
+				ipversion: consts.IpVersionStr_4,
+			}, nil
+		},
+		TimeoutExceedCallback: func(*dialArgument, error) {},
+	})
+	if err != nil {
+		t.Fatalf("NewDnsController() returned error: %v", err)
+	}
+	defer controller.Close()
+
+	var requestID uint16
+	controller.forwarderFactory = func(upstream *componentdns.Upstream, dialArg dialArgument) (DnsForwarder, error) {
+		forwardedHosts = append(forwardedHosts, upstream.Hostname)
+		switch upstream.Hostname {
+		case "1.1.1.1":
+			resp := newTestDnsResponse(
+				"example.com.",
+				dnsmessage.TypeA,
+				newTestARecord("example.com.", "1.1.1.1"),
+				false,
+			)
+			resp.Id = requestID
+			return &fakeDnsForwarder{msg: resp}, nil
+		case "2.2.2.2":
+			resp := newTestDnsResponse(
+				"example.com.",
+				dnsmessage.TypeA,
+				newTestARecord("example.com.", "2.2.2.2"),
+				false,
+			)
+			resp.Id = requestID
+			return &fakeDnsForwarder{msg: resp}, nil
+		default:
+			return nil, fmt.Errorf("unexpected upstream host: %s", upstream.Hostname)
+		}
+	}
+
+	req := &udpRequest{
+		ctx:           context.Background(),
+		realSrc:       netip.MustParseAddrPort("127.0.0.1:43210"),
+		realDst:       netip.MustParseAddrPort("127.0.0.1:53"),
+		src:           netip.MustParseAddrPort("127.0.0.1:43210"),
+		routingResult: &bpfRoutingResult{},
+	}
+	msg := new(dnsmessage.Msg)
+	msg.SetQuestion("example.com.", dnsmessage.TypeA)
+	data, err := msg.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID = msg.Id
+
+	err = controller.dialSend(0, req, data, &componentdns.Upstream{
+		Scheme:   componentdns.UpstreamScheme_UDP,
+		Hostname: "1.1.1.1",
+		Port:     53,
+		Index:    consts.DnsRequestOutboundIndex(0),
+		Ip46: &netutils.Ip46{
+			Ip4: netip.MustParseAddr("1.1.1.1"),
+		},
+	}, false)
+	if err != nil {
+		t.Fatalf("dialSend() returned error: %v", err)
+	}
+
+	if len(forwardedHosts) != 2 || forwardedHosts[0] != "1.1.1.1" || forwardedHosts[1] != "2.2.2.2" {
+		t.Fatalf("unexpected forwarded hosts: %v", forwardedHosts)
+	}
+
+	cache := controller.LookupDnsRespCache(controller.cacheKey("example.com.", dnsmessage.TypeA), false)
+	if cache == nil {
+		t.Fatal("expected DNS cache entry after response reroute")
+	}
+	if !cache.IncludeIp(netip.MustParseAddr("2.2.2.2")) {
+		t.Fatalf("expected cache to contain rerouted answer, got %v", cache.CachedIPs())
+	}
+	if cache.IncludeIp(netip.MustParseAddr("1.1.1.1")) {
+		t.Fatalf("expected first upstream answer to be superseded, got %v", cache.CachedIPs())
 	}
 }
 
@@ -1432,7 +1898,7 @@ func TestDialSendRejectsMismatchedResponseQuestion(t *testing.T) {
 	}
 	requestID = msg.Id
 
-	err = controller.dialSend(0, req, data, msg.Id, &componentdns.Upstream{
+	err = controller.dialSend(0, req, data, &componentdns.Upstream{
 		Scheme:   componentdns.UpstreamScheme_UDP,
 		Hostname: "1.1.1.1",
 		Port:     53,
@@ -1531,7 +1997,7 @@ func TestDialSendRejectsMismatchedResponseIDForUdpUpstream(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = controller.dialSend(0, req, data, msg.Id, &componentdns.Upstream{
+	err = controller.dialSend(0, req, data, &componentdns.Upstream{
 		Scheme:   componentdns.UpstreamScheme_UDP,
 		Hostname: "1.1.1.1",
 		Port:     53,
@@ -1630,7 +2096,7 @@ func TestDialSendAllowsZeroResponseIDForDoH(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = controller.dialSend(0, req, data, msg.Id, &componentdns.Upstream{
+	err = controller.dialSend(0, req, data, &componentdns.Upstream{
 		Scheme:   componentdns.UpstreamScheme_HTTPS,
 		Hostname: "dns.example.com",
 		Port:     443,
@@ -1648,6 +2114,6 @@ func TestDialSendAllowsZeroResponseIDForDoH(t *testing.T) {
 		t.Fatal("expected dns cache entry after accepted DoH-style zero response id")
 	}
 	if !cache.IncludeIp(netip.MustParseAddr("7.7.7.7")) {
-		t.Fatalf("expected cache to contain DoH answer, got %v", cache.cachedIPs())
+		t.Fatalf("expected cache to contain DoH answer, got %v", cache.CachedIPs())
 	}
 }

@@ -6,7 +6,6 @@
 package control
 
 import (
-	"context"
 	"net"
 	"net/netip"
 	"strings"
@@ -180,15 +179,13 @@ func TestHandleWithResponseWriterRejectsAsIsForLocalListener(t *testing.T) {
 	req := new(dnsmessage.Msg)
 	req.SetQuestion("example.com.", dnsmessage.TypeA)
 
-	err = controller.handleWithResponseWriter_(req, &udpRequest{
-		ctx:     context.Background(),
-		realSrc: netip.MustParseAddrPort("127.0.0.1:43210"),
-		realDst: netip.MustParseAddrPort("127.0.0.1:5353"),
-		src:     netip.MustParseAddrPort("127.0.0.1:43210"),
-	}, true, &fakeDNSResponseWriter{
-		localAddr:  &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5353},
-		remoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 43210},
-	})
+	err = controller.HandleLocalRequestWithResponseWriter(req,
+		netip.MustParseAddrPort("127.0.0.1:43210"),
+		netip.MustParseAddrPort("127.0.0.1:5353"),
+		&fakeDNSResponseWriter{
+			localAddr:  &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5353},
+			remoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 43210},
+		})
 	if err == nil {
 		t.Fatal("expected local dns listener to reject asis")
 	}

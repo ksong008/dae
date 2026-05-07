@@ -15,6 +15,10 @@ import (
 )
 
 func (s *Sniffer) SniffHttp() (d string, err error) {
+	if d, err, ok := s.trySniffHTTPRust(); ok {
+		return d, err
+	}
+
 	// First byte should be printable.
 	if s.buf.Len() == 0 || !unicode.IsPrint(rune(s.buf.Bytes()[0])) {
 		return "", ErrNotApplicable

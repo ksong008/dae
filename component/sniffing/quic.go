@@ -6,11 +6,13 @@
 package sniffing
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"io/fs"
 
+	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/component/sniffing/internal/quicutils"
-	"github.com/daeuniverse/outbound/pool"
 )
 
 const (
@@ -37,10 +39,14 @@ const (
 )
 
 func (s *Sniffer) SniffQuic() (d string, err error) {
+	if d, err, ok := s.trySniffQUICRust(); ok {
+		return d, err
+	}
+
 	nextBlock := s.buf.Bytes()[s.quicNextRead:]
 	isQuic := false
 	for {
-		s.quicCryptos, nextBlock, err = sniffQuicBlock(s.quicCryptos, nextBlock)
+		s.quicCryptos, nextBlock, err = s.sniffQuicBlock(s.quicCryptos, nextBlock)
 		if err != nil {
 			// If block is not a quic block, return it.
 			if errors.Is(err, ErrNotApplicable) {
@@ -66,7 +72,7 @@ func (s *Sniffer) SniffQuic() (d string, err error) {
 	}
 	// Is quic.
 	s.quicNextRead = s.buf.Len()
-	sni, err := extractSniFromTls(quicutils.NewLinearLocator(s.quicCryptos))
+	sni, err := extractSniFromTls(s.quicLocator.Reset(s.quicCryptos))
 	if err != nil {
 		s.needMore = true
 		return "", ErrNotFound
@@ -74,7 +80,7 @@ func (s *Sniffer) SniffQuic() (d string, err error) {
 	return sni, nil
 }
 
-func sniffQuicBlock(cryptos []*quicutils.CryptoFrameOffset, buf []byte) (new []*quicutils.CryptoFrameOffset, next []byte, err error) {
+func (s *Sniffer) sniffQuicBlock(cryptos []quicutils.CryptoFrameOffset, buf []byte) (new []quicutils.CryptoFrameOffset, next []byte, err error) {
 	// QUIC: A UDP-Based Multiplexed and Secure Transport
 	// https://datatracker.ietf.org/doc/html/rfc9000#name-initial-packet
 	const dstConnIdPos = 6
@@ -137,17 +143,36 @@ func sniffQuicBlock(cryptos []*quicutils.CryptoFrameOffset, buf []byte) (new []*
 	// This function will modify the packet in place, thus we should save the first byte and MaxPacketNumberLength
 	// and recover it later.
 	firstByte := header[0]
-	rawPacketNumber := pool.Get(quicutils.MaxPacketNumberLength)
-	copy(rawPacketNumber, header[boundary-quicutils.MaxPacketNumberLength:])
+	var rawPacketNumber [quicutils.MaxPacketNumberLength]byte
+	copy(rawPacketNumber[:], header[boundary-quicutils.MaxPacketNumberLength:])
 	defer func() {
 		header[0] = firstByte
-		copy(header[boundary-quicutils.MaxPacketNumberLength:], rawPacketNumber)
-		pool.Put(rawPacketNumber)
+		copy(header[boundary-quicutils.MaxPacketNumberLength:], rawPacketNumber[:])
 	}()
-	plaintext, err := quicutils.DecryptQuic_(header, blockEnd, destConnId)
+	version, err := quicutils.ParseVersion(binary.BigEndian.Uint32(header[1:]))
 	if err != nil {
 		return cryptos, nil, ErrNotApplicable
 	}
+	if len(destConnId) > QuicMaxConnectionIDLength {
+		return cryptos, nil, ErrNotApplicable
+	}
+	if s.quicKeys == nil || s.quicKeysVer != version || s.quicKeysCIDN != len(destConnId) || !bytes.Equal(s.quicKeysCID[:s.quicKeysCIDN], destConnId) {
+		if s.quicKeys != nil {
+			_ = s.quicKeys.Close()
+		}
+		s.quicKeys, err = quicutils.NewKeys(destConnId, version, common.NewGcm)
+		if err != nil {
+			s.quicKeys = nil
+			return cryptos, nil, ErrNotApplicable
+		}
+		s.quicKeysVer = version
+		s.quicKeysCIDN = copy(s.quicKeysCID[:], destConnId)
+	}
+	plaintext, err := quicutils.DecryptQuicWithKeysFromPool_(header, blockEnd, s.quicKeys)
+	if err != nil {
+		return cryptos, nil, ErrNotApplicable
+	}
+	s.quicPlaintexts = append(s.quicPlaintexts, plaintext)
 	// Now, we confirm it is exact a quic frame.
 	// After here, we should not return NotApplicableError.
 	// And we should return nextFrame.

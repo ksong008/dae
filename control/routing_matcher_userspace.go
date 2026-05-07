@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
+	"unsafe"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/routing"
@@ -17,10 +19,48 @@ import (
 )
 
 type RoutingMatcher struct {
-	lpmMatcher    []*trie.Trie
-	domainMatcher routing.DomainMatcher // All domain matchSets use one DomainMatcher.
+	mu               sync.RWMutex
+	closed           bool
+	rustMatcher      *rustUserspaceRoutingMatcherRuntime
+	lpmMatcher       []*trie.Trie
+	domainMatcher    routing.DomainMatcher // All domain matchSets use one DomainMatcher.
+	domainBitmapPool *sync.Pool
 
 	matches []bpfMatchSet
+}
+
+func (m *RoutingMatcher) Close() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return
+	}
+	m.closed = true
+	if m.rustMatcher != nil {
+		m.rustMatcher.Close()
+		return
+	}
+	if closer, ok := m.domainMatcher.(routing.DomainMatcherCloser); ok {
+		closer.Close()
+	}
+}
+
+func (m *RoutingMatcher) MatchDomainBitmap(domain string) ([]uint32, error) {
+	if m == nil {
+		return nil, fmt.Errorf("routing matcher is nil")
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return nil, fmt.Errorf("routing matcher is closed")
+	}
+	if m.rustMatcher != nil {
+		return m.rustMatcher.MatchDomainBitmap(domain)
+	}
+	return m.domainMatcher.MatchDomainBitmap(domain), nil
 }
 
 // Match is modified from kern/tproxy.c; please keep sync.
@@ -39,15 +79,67 @@ func (m *RoutingMatcher) Match(
 	if len(sourceAddr) != net.IPv6len || len(destAddr) != net.IPv6len || len(mac) != net.IPv6len {
 		return 0, 0, false, fmt.Errorf("bad address length")
 	}
+	return m.MatchAddr16(
+		(*[16]byte)(unsafe.Pointer(&sourceAddr[0])),
+		(*[16]byte)(unsafe.Pointer(&destAddr[0])),
+		sourcePort,
+		destPort,
+		ipVersion,
+		l4proto,
+		domain,
+		processName,
+		tos,
+		(*[16]byte)(unsafe.Pointer(&mac[0])),
+	)
+}
+
+func (m *RoutingMatcher) MatchAddr16(
+	sourceAddr *[16]byte,
+	destAddr *[16]byte,
+	sourcePort uint16,
+	destPort uint16,
+	ipVersion consts.IpVersionType,
+	l4proto consts.L4ProtoType,
+	domain string,
+	processName [16]uint8,
+	tos uint8,
+	mac *[16]byte,
+) (outboundIndex consts.OutboundIndex, mark uint32, must bool, err error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return 0, 0, false, fmt.Errorf("routing matcher is closed")
+	}
+	if m.rustMatcher != nil {
+		return m.rustMatcher.MatchAddr16(
+			sourceAddr,
+			destAddr,
+			sourcePort,
+			destPort,
+			ipVersion,
+			l4proto,
+			domain,
+			processName,
+			tos,
+			mac,
+		)
+	}
 
 	bin128s := make([]string, consts.MatchType_Mac+1)
-	bin128s[consts.MatchType_IpSet] = trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(*(*[16]byte)(destAddr)), 128))
-	bin128s[consts.MatchType_SourceIpSet] = trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(*(*[16]byte)(sourceAddr)), 128))
-	bin128s[consts.MatchType_Mac] = trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(*(*[16]byte)(mac)), 128))
+	bin128s[consts.MatchType_IpSet] = trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(*destAddr), 128))
+	bin128s[consts.MatchType_SourceIpSet] = trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(*sourceAddr), 128))
+	bin128s[consts.MatchType_Mac] = trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(*mac), 128))
 
 	var domainMatchBitmap []uint32
 	if domain != "" {
-		domainMatchBitmap = m.domainMatcher.MatchDomainBitmap(domain)
+		var domainBitmapBuffer *routing.DomainBitmapBuffer
+		domainMatchBitmap, domainBitmapBuffer, err = routing.MatchDomainBitmapWithPool(m.domainMatcher, m.domainBitmapPool, domain)
+		if err != nil {
+			return 0, 0, false, fmt.Errorf("match domain bitmap: %w", err)
+		}
+		if domainBitmapBuffer != nil {
+			defer routing.PutDomainBitmap(m.domainBitmapPool, domainBitmapBuffer)
+		}
 	}
 
 	goodSubrule := false

@@ -1,0 +1,57 @@
+{
+  "domain_bitmap_words": 1,
+  "domain_hits": {
+    "example.com": [1]
+  },
+  "ip_sets": [
+    ["1.1.1.0/24"]
+  ],
+  "rules": [
+    {
+      "conditions": [
+        { "kind": "domain_bit", "bit_index": 0, "not": false },
+        { "kind": "qtype_any", "values": [1, 28], "not": false },
+        { "kind": "upstream_any", "values": [3], "not": false }
+      ],
+      "action": { "kind": "user_defined", "value": 7 }
+    },
+    {
+      "conditions": [
+        { "kind": "ip_in_set", "set_index": 0, "not": false }
+      ],
+      "action": { "kind": "reject" }
+    },
+    {
+      "conditions": [
+        { "kind": "fallback" }
+      ],
+      "action": { "kind": "accept" }
+    }
+  ],
+  "cases": [
+    {
+      "name": "domain_qtype_and_upstream_hit_primary_rule",
+      "qname": "example.com",
+      "qtype": 1,
+      "ips": ["8.8.8.8"],
+      "request_upstream": 3,
+      "expected": { "kind": "user_defined", "value": 7 }
+    },
+    {
+      "name": "ip_set_rule_hits_when_primary_rule_misses",
+      "qname": "miss.example",
+      "qtype": 15,
+      "ips": ["1.1.1.8"],
+      "request_upstream": 9,
+      "expected": { "kind": "reject" }
+    },
+    {
+      "name": "fallback_handles_total_miss",
+      "qname": "miss.example",
+      "qtype": 15,
+      "ips": [],
+      "request_upstream": 9,
+      "expected": { "kind": "accept" }
+    }
+  ]
+}

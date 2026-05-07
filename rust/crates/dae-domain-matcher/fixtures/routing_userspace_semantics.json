@@ -1,0 +1,86 @@
+{
+  "domain_bitmap_words": 1,
+  "domain_hits": {
+    "example.com": [1]
+  },
+  "sets": {
+    "dest_ip": [
+      ["203.0.113.0/24"]
+    ],
+    "source_ip": [],
+    "mac": []
+  },
+  "rules": [
+    {
+      "conditions": [
+        { "kind": "domain_bit", "bit_index": 0, "not": false },
+        { "kind": "dest_port_any", "ranges": [[443, 443]], "not": false }
+      ],
+      "action": { "kind": "continue_must" }
+    },
+    {
+      "conditions": [
+        { "kind": "l4proto_mask", "mask": 1, "not": false },
+        { "kind": "dscp_any", "values": [46], "not": false }
+      ],
+      "action": { "kind": "route", "outbound": 7, "mark": 123, "must": false }
+    },
+    {
+      "conditions": [
+        { "kind": "set_any", "set_kind": "dest_ip", "set_index": 0, "not": false },
+        { "kind": "process_name_any", "names": ["curl"], "not": false }
+      ],
+      "action": { "kind": "route", "outbound": 9, "mark": 0, "must": false }
+    },
+    {
+      "conditions": [
+        { "kind": "fallback" }
+      ],
+      "action": { "kind": "route", "outbound": 2, "mark": 0, "must": false }
+    }
+  ],
+  "cases": [
+    {
+      "name": "must_rule_carries_into_later_route",
+      "source_ip": "198.51.100.2",
+      "dest_ip": "198.51.100.9",
+      "source_port": 40000,
+      "dest_port": 443,
+      "ip_version": 1,
+      "l4proto": 1,
+      "domain": "example.com",
+      "process_name": "curl",
+      "dscp": 46,
+      "mac": "00:00:00:00:00:00",
+      "expected": { "outbound": 7, "mark": 123, "must": true }
+    },
+    {
+      "name": "dest_ip_and_process_name_rule_hits_when_must_rule_misses",
+      "source_ip": "198.51.100.2",
+      "dest_ip": "203.0.113.7",
+      "source_port": 32000,
+      "dest_port": 80,
+      "ip_version": 1,
+      "l4proto": 2,
+      "domain": "miss.example",
+      "process_name": "curl",
+      "dscp": 0,
+      "mac": "00:00:00:00:00:00",
+      "expected": { "outbound": 9, "mark": 0, "must": false }
+    },
+    {
+      "name": "fallback_handles_total_miss",
+      "source_ip": "198.51.100.2",
+      "dest_ip": "198.51.100.9",
+      "source_port": 32000,
+      "dest_port": 53,
+      "ip_version": 2,
+      "l4proto": 2,
+      "domain": "miss.example",
+      "process_name": "dae",
+      "dscp": 0,
+      "mac": "00:00:00:00:00:00",
+      "expected": { "outbound": 2, "mark": 0, "must": false }
+    }
+  ]
+}

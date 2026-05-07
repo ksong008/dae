@@ -355,8 +355,13 @@ func (b *RoutingMatcherBuilder) BuildKernspace(log *logrus.Logger) (err error) {
 }
 
 func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err error) {
+	if runtime, err := newRustUserspaceRoutingMatcherRuntime(consts.MaxMatchSetLen, b.simulatedDomainSet, b.simulatedLpmTries, b.rules); err != nil {
+		return nil, err
+	} else if runtime != nil {
+		return &RoutingMatcher{rustMatcher: runtime}, nil
+	}
 	// Build domainMatcher
-	domainMatcher := domain_matcher.NewAhocorasickSlimtrie(b.log, consts.MaxMatchSetLen)
+	domainMatcher := domain_matcher.NewDefaultDomainMatcher(b.log, consts.MaxMatchSetLen)
 	for _, domains := range b.simulatedDomainSet {
 		domainMatcher.AddSet(domains.RuleIndex, domains.Domains, domains.Key)
 	}
@@ -380,8 +385,9 @@ func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err e
 	}
 
 	return &RoutingMatcher{
-		lpmMatcher:    lpmMatcher,
-		domainMatcher: domainMatcher,
-		matches:       b.rules,
+		lpmMatcher:       lpmMatcher,
+		domainMatcher:    domainMatcher,
+		domainBitmapPool: routing.NewDomainBitmapPool(domainMatcher, consts.MaxMatchSetLen),
+		matches:          b.rules,
 	}, nil
 }

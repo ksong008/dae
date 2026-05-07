@@ -8,7 +8,10 @@
 package quicutils
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"hash"
 	"io"
 
@@ -34,4 +37,50 @@ func HkdfExpandLabelFromPool(h func() hash.Hash, secret, label []byte, context [
 		return nil, err
 	}
 	return out, nil
+}
+
+func HkdfExtractSHA256Into(salt, secret, out []byte) error {
+	if len(out) < sha256.Size {
+		return fmt.Errorf("hkdf extract output too short: %d", len(out))
+	}
+	mac := hmac.New(sha256.New, salt)
+	if _, err := mac.Write(secret); err != nil {
+		return err
+	}
+	var sum [sha256.Size]byte
+	copy(out, mac.Sum(sum[:0]))
+	return nil
+}
+
+func HkdfExpandLabelSHA256Into(secret, label []byte, context []byte, out []byte) error {
+	var info [64]byte
+	infoLen := 3 + 6 + len(label) + 1 + len(context)
+	if infoLen > len(info) {
+		return fmt.Errorf("hkdf label too long: %d", infoLen)
+	}
+	binary.BigEndian.PutUint16(info[:2], uint16(len(out)))
+	info[2] = uint8(6 + len(label))
+	copy(info[3:], "tls13 ")
+	copy(info[9:], label)
+	info[9+len(label)] = uint8(len(context))
+	copy(info[10+len(label):], context)
+
+	return HkdfExpandSHA256Into(secret, info[:infoLen], out)
+}
+
+func HkdfExpandSHA256Into(secret, info []byte, out []byte) error {
+	if len(out) > sha256.Size {
+		return fmt.Errorf("hkdf expand output too long: %d", len(out))
+	}
+	mac := hmac.New(sha256.New, secret)
+	if _, err := mac.Write(info); err != nil {
+		return err
+	}
+	var counter = [1]byte{1}
+	if _, err := mac.Write(counter[:]); err != nil {
+		return err
+	}
+	var sum [sha256.Size]byte
+	copy(out, mac.Sum(sum[:0]))
+	return nil
 }

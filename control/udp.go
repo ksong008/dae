@@ -57,7 +57,7 @@ func sendPkt(anyfromPool *AnyfromPool, log *logrus.Logger, data []byte, from net
 	if anyfromPool == nil {
 		anyfromPool = DefaultAnyfromPool
 	}
-	uConn, _, err := anyfromPool.GetOrCreate(from.String(), AnyfromTimeout)
+	uConn, _, err := anyfromPool.GetOrCreate(from, AnyfromTimeout)
 	if err != nil {
 		return
 	}
@@ -171,14 +171,7 @@ func (c *ControlPlane) handlePkt(ctx context.Context, lConn *net.UDPConn, data [
 		routingResult.Mark = c.soMarkFromDae
 	}
 	if isDns {
-		return c.dnsController.Handle_(dnsMessage, &udpRequest{
-			ctx:           reqCtx,
-			realSrc:       realSrc,
-			realDst:       realDst,
-			src:           src,
-			lConn:         lConn,
-			routingResult: routingResult,
-		})
+		return c.dns.HandlePacketRequest(dnsMessage, reqCtx, realSrc, realDst, src, lConn, routingResult)
 	}
 
 	// Dial and send.

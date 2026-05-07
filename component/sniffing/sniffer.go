@@ -21,7 +21,17 @@ import (
 const (
 	PacketSnifferMaxBufferedBytes = 64 * 1024
 	PacketSnifferMaxChunks        = 64
+	QuicMaxConnectionIDLength     = 20
+	packetSnifferInlineChunks     = 4
+	quicInlineCryptoFrames        = 16
+	quicInlinePlaintexts          = 4
 )
+
+var packetDataReady = func() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
 
 type Sniffer struct {
 	// Stream
@@ -41,10 +51,20 @@ type Sniffer struct {
 	closed    bool
 
 	// Packet
-	data         [][]byte
-	needMore     bool
-	quicNextRead int
-	quicCryptos  []*quicutils.CryptoFrameOffset
+	data             [][]byte
+	dataBuf          [packetSnifferInlineChunks][]byte
+	needMore         bool
+	quicNextRead     int
+	quicCryptos      []quicutils.CryptoFrameOffset
+	quicCryptoBuf    [quicInlineCryptoFrames]quicutils.CryptoFrameOffset
+	quicLocator      quicutils.LinearLocator
+	quicKeys         *quicutils.Keys
+	quicKeysCID      [QuicMaxConnectionIDLength]byte
+	quicKeysCIDN     int
+	quicKeysVer      quicutils.Version
+	quicPlaintexts   [][]byte
+	quicPlaintextBuf [quicInlinePlaintexts][]byte
+	rustSniffing     rustSniffingState
 }
 
 func NewStreamSniffer(r io.Reader, timeout time.Duration) *Sniffer {
@@ -66,16 +86,18 @@ func NewStreamSniffer(r io.Reader, timeout time.Duration) *Sniffer {
 func NewPacketSniffer(data []byte, timeout time.Duration) *Sniffer {
 	buffer := pool.GetBuffer()
 	buffer.Write(data)
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	_ = timeout
 	s := &Sniffer{
 		stream:    false,
 		r:         nil,
 		buf:       buffer,
-		data:      [][]byte{buffer.Bytes()},
-		dataReady: make(chan struct{}),
-		ctx:       ctx,
-		cancel:    cancel,
+		dataReady: packetDataReady,
+		ctx:       context.Background(),
+		cancel:    func() {},
 	}
+	s.data = append(s.dataBuf[:0], buffer.Bytes())
+	s.quicCryptos = s.quicCryptoBuf[:0]
+	s.quicPlaintexts = s.quicPlaintextBuf[:0]
 	return s
 }
 
@@ -138,7 +160,9 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 				return "", fmt.Errorf("%w: %w", ErrNotApplicable, context.DeadlineExceeded)
 			}
 		} else {
-			close(s.dataReady)
+			if s.dataReady != packetDataReady {
+				close(s.dataReady)
+			}
 		}
 
 		if s.buf.Len() == 0 {
@@ -256,6 +280,16 @@ func (s *Sniffer) Close() (err error) {
 			pool.PutBuffer(s.buf)
 			s.buf = nil
 		}
+		if s.quicKeys != nil {
+			_ = s.quicKeys.Close()
+			s.quicKeys = nil
+		}
+		s.quicKeysCIDN = 0
+		for _, plaintext := range s.quicPlaintexts {
+			pool.Put(plaintext)
+		}
+		s.closeRustSniffing()
+		s.quicPlaintexts = s.quicPlaintextBuf[:0]
 		s.data = nil
 	})
 	return nil
