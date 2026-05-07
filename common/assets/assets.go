@@ -44,6 +44,39 @@ func NewLocationFinder(externDirPath []string) *LocationFinder {
 	}
 }
 
+func buildSearchDirs(externDirs []string, location string) []string {
+	var searchDirs []string
+	folder := consts.LocationAssetFolder
+	if location != "" {
+		searchDirs = append(searchDirs, location)
+		searchDirs = append(searchDirs, externDirs...)
+		if runtime.GOOS != "windows" {
+			searchDirs = append(
+				searchDirs,
+				filepath.Join("/usr/local/share", folder),
+				filepath.Join("/usr/share", folder),
+			)
+		}
+		searchDirs = append(searchDirs, externDirs...)
+		return searchDirs
+	}
+	searchDirs = append(searchDirs, externDirs...)
+	if runtime.GOOS != "windows" {
+		xdgDirs := append([]string{xdg.DataHome}, xdg.DataDirs...)
+		for i := range xdgDirs {
+			xdgDirs[i] = filepath.Join(xdgDirs[i], folder)
+		}
+		searchDirs = append(searchDirs, xdgDirs...)
+		return searchDirs
+	}
+	pwd := "./"
+	if absPath, e := filepath.Abs(pwd); e == nil {
+		pwd = absPath
+	}
+	searchDirs = append(searchDirs, pwd)
+	return searchDirs
+}
+
 func (c *LocationFinder) GetLocationAsset(log *logrus.Logger, filename string) (path string, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -67,44 +100,7 @@ func (c *LocationFinder) GetLocationAsset(log *logrus.Logger, filename string) (
 		}
 	}()
 
-	// Search dirs.
-	var searchDirs []string
-	folder := consts.AppName
-	// check if DAE_LOCATION_ASSET is set
-	location := os.Getenv("DAE_LOCATION_ASSET")
-	if location != "" {
-		// add DAE_LOCATION_ASSET to search path
-		searchDirs = append(searchDirs, location)
-		// add /etc/dae to search path
-		searchDirs = append(searchDirs, c.externDirs...)
-		// additional paths for non windows platforms
-		if runtime.GOOS != "windows" {
-			searchDirs = append(
-				searchDirs,
-				filepath.Join("/usr/local/share", folder),
-				filepath.Join("/usr/share", folder),
-			)
-		}
-		searchDirs = append(searchDirs, c.externDirs...)
-	} else {
-		// add /etc/dae to search path
-		searchDirs = append(searchDirs, c.externDirs...)
-		if runtime.GOOS != "windows" {
-			// Search XDG data directories on non windows platform
-			xdgDirs := append([]string{xdg.DataHome}, xdg.DataDirs...)
-			for i := range xdgDirs {
-				xdgDirs[i] = filepath.Join(xdgDirs[i], folder)
-			}
-			searchDirs = append(searchDirs, xdgDirs...)
-		} else {
-			// fallback to the old behavior of using only current dir on Windows
-			pwd := "./"
-			if absPath, e := filepath.Abs(pwd); e == nil {
-				pwd = absPath
-			}
-			searchDirs = append(searchDirs, pwd)
-		}
-	}
+	searchDirs := buildSearchDirs(c.externDirs, os.Getenv("DAE_LOCATION_ASSET"))
 	log.Debugf(`Search "%v" in [%v]`, filename, strings.Join(searchDirs, ", "))
 	for _, searchDir := range searchDirs {
 		searchPath := filepath.Join(searchDir, filename)
