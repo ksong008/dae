@@ -117,7 +117,7 @@ jobs:
 
       - name: Install daed web dependencies
         working-directory: daed
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --no-frozen-lockfile
 
       - name: Run daerust promotion gate
         working-directory: dae
