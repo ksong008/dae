@@ -1,6 +1,9 @@
 name: daerust-promotion
 
 on:
+  push:
+    branches:
+      - daerust
   workflow_dispatch:
     inputs:
       dae_wing_repository:
