@@ -173,7 +173,7 @@ func appendUDPSegmentSizeMsg(b []byte, size uint16) []byte {
 
 // AnyfromPool is a full-cone udp listener pool
 type AnyfromPool struct {
-	pool      map[string]*Anyfrom
+	pool      map[netip.AddrPort]*Anyfrom
 	mu        sync.RWMutex
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -191,7 +191,7 @@ func NewAnyfromPool() *AnyfromPool {
 func NewAnyfromPoolWithNetns(netns *DaeNetns) *AnyfromPool {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &AnyfromPool{
-		pool:   make(map[string]*Anyfrom, 64),
+		pool:   make(map[netip.AddrPort]*Anyfrom, 64),
 		mu:     sync.RWMutex{},
 		ctx:    ctx,
 		cancel: cancel,
@@ -250,7 +250,7 @@ func (p *AnyfromPool) sweepExpired(now time.Time) {
 
 func (p *AnyfromPool) evictOldestLocked(now time.Time) *Anyfrom {
 	var (
-		oldestKey  string
+		oldestKey  netip.AddrPort
 		oldest     *Anyfrom
 		oldestTime time.Time
 		oldestSeen bool
@@ -290,7 +290,7 @@ func (p *AnyfromPool) Flush() error {
 	var errs []error
 	p.mu.Lock()
 	all := p.pool
-	p.pool = make(map[string]*Anyfrom, 64)
+	p.pool = make(map[netip.AddrPort]*Anyfrom, 64)
 	p.mu.Unlock()
 	for _, af := range all {
 		if err := af.Close(); err != nil {
@@ -311,7 +311,7 @@ func udpConnFromPacketConn(pc net.PacketConn) (*net.UDPConn, error) {
 	return nil, fmt.Errorf("expected *net.UDPConn, got %T", pc)
 }
 
-func (p *AnyfromPool) GetOrCreate(lAddr string, ttl time.Duration) (conn *Anyfrom, isNew bool, err error) {
+func (p *AnyfromPool) GetOrCreate(lAddr netip.AddrPort, ttl time.Duration) (conn *Anyfrom, isNew bool, err error) {
 	p.mu.RLock()
 	af, ok := p.pool[lAddr]
 	if !ok {
@@ -336,7 +336,7 @@ func (p *AnyfromPool) GetOrCreate(lAddr string, ttl time.Duration) (conn *Anyfro
 		}
 		if err = daens.With(func() error {
 			var listenErr error
-			pc, listenErr = d.ListenPacket(context.Background(), "udp", lAddr)
+			pc, listenErr = d.ListenPacket(context.Background(), "udp", lAddr.String())
 			return listenErr
 		}); err != nil {
 			return nil, true, err

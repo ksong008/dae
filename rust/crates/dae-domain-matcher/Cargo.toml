@@ -1,0 +1,31 @@
+[package]
+name = "dae-domain-matcher"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version = "1.95"
+description = "Staged Rust domain matcher for dae"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+aho-corasick = "1.1.4"
+regex = "1.12.2"
+rustc-hash = "2.1"
+smallvec = "1.15"
+
+[dev-dependencies]
+criterion = "0.7.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bench]]
+name = "domain_matcher"
+harness = false
+
+[[bench]]
+name = "decision_loops"
+harness = false

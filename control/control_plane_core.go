@@ -618,7 +618,7 @@ func (c *controlPlaneCore) BatchUpdateDomainRouting(cache *DnsCache) error {
 		return c.domainRouting.syncOwner(c.bpf.DomainRoutingMap, cache.RouteOwnerKey, snapshot)
 	}
 
-	ips := cache.cachedIPs()
+	ips := cache.CachedIPs()
 	if len(ips) == 0 {
 		return nil
 	}
@@ -651,7 +651,7 @@ func (c *controlPlaneCore) BatchRemoveDomainRouting(cache *DnsCache) error {
 		return c.domainRouting.syncOwner(c.bpf.DomainRoutingMap, cache.RouteOwnerKey, domainRoutingOwnerSnapshot{})
 	}
 
-	ips := cache.cachedIPs()
+	ips := cache.CachedIPs()
 	if len(ips) == 0 {
 		return nil
 	}

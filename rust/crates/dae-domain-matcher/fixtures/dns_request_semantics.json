@@ -1,0 +1,59 @@
+{
+  "domain_bitmap_words": 1,
+  "domain_hits": {
+    "example.com": [1]
+  },
+  "rules": [
+    {
+      "conditions": [
+        { "kind": "domain_bit", "bit_index": 0, "not": false },
+        { "kind": "qtype_any", "values": [1, 28], "not": false }
+      ],
+      "action": { "kind": "user_defined", "value": 3 }
+    },
+    {
+      "conditions": [
+        { "kind": "qtype_any", "values": [15], "not": true }
+      ],
+      "action": { "kind": "reject" }
+    },
+    {
+      "conditions": [
+        { "kind": "fallback" }
+      ],
+      "action": { "kind": "asis" }
+    }
+  ],
+  "cases": [
+    {
+      "name": "domain_and_first_qtype_hit_primary_rule",
+      "qname": "example.com",
+      "qtype": 1,
+      "expected": { "kind": "user_defined", "value": 3 }
+    },
+    {
+      "name": "domain_and_second_qtype_hit_primary_rule",
+      "qname": "example.com",
+      "qtype": 28,
+      "expected": { "kind": "user_defined", "value": 3 }
+    },
+    {
+      "name": "negated_qtype_rule_rejects_when_primary_rule_misses",
+      "qname": "miss.example",
+      "qtype": 16,
+      "expected": { "kind": "reject" }
+    },
+    {
+      "name": "fallback_handles_negated_qtype_miss_without_domain_hit",
+      "qname": "miss.example",
+      "qtype": 15,
+      "expected": { "kind": "asis" }
+    },
+    {
+      "name": "fallback_handles_primary_rule_qtype_miss_even_when_domain_matched",
+      "qname": "example.com",
+      "qtype": 15,
+      "expected": { "kind": "asis" }
+    }
+  ]
+}

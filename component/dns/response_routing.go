@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/netip"
 	"strconv"
+	"sync"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/routing"
@@ -23,6 +24,7 @@ type ResponseMatcherBuilder struct {
 	log                *logrus.Logger
 	upstreamName2Id    map[string]uint8
 	simulatedDomainSet []routing.DomainSet
+	simulatedIpPrefixes [][]netip.Prefix
 	ipSet              []*trie.Trie
 	fallback           *routing.Outbound
 	rules              []responseMatchSet
@@ -72,11 +74,12 @@ func (b *ResponseMatcherBuilder) addIp(f *config_parser.Function, cidrs []netip.
 		return err
 	}
 	rule := responseMatchSet{
-		Value:    uint16(len(b.ipSet)),
+		Value:    uint16(len(b.simulatedIpPrefixes)),
 		Type:     consts.MatchType_IpSet,
 		Not:      f.Not,
 		Upstream: uint8(upstreamId),
 	}
+	b.simulatedIpPrefixes = append(b.simulatedIpPrefixes, cidrs)
 	t, err := trie.NewTrieFromPrefixes(cidrs)
 	if err != nil {
 		return err
@@ -180,14 +183,22 @@ func (b *ResponseMatcherBuilder) addFallback(fallbackOutbound config.FunctionOrS
 
 func (b *ResponseMatcherBuilder) Build() (matcher *ResponseMatcher, err error) {
 	var m ResponseMatcher
+	m.rustMatcher, err = newResponseMatcherRuntime(consts.MaxMatchSetLen, b.simulatedDomainSet, b.simulatedIpPrefixes, b.rules)
+	if err != nil {
+		return nil, err
+	}
+	if m.rustMatcher != nil {
+		return &m, nil
+	}
 	// Build domainMatcher.
-	m.domainMatcher = domain_matcher.NewAhocorasickSlimtrie(b.log, consts.MaxMatchSetLen)
+	m.domainMatcher = domain_matcher.NewDefaultDomainMatcher(b.log, consts.MaxMatchSetLen)
 	for _, domains := range b.simulatedDomainSet {
 		m.domainMatcher.AddSet(domains.RuleIndex, domains.Domains, domains.Key)
 	}
 	if err = m.domainMatcher.Build(); err != nil {
 		return nil, err
 	}
+	m.domainBitmapPool = routing.NewDomainBitmapPool(m.domainMatcher, consts.MaxMatchSetLen)
 	// IpSet.
 	m.ipSet = b.ipSet
 
@@ -202,10 +213,33 @@ func (b *ResponseMatcherBuilder) Build() (matcher *ResponseMatcher, err error) {
 }
 
 type ResponseMatcher struct {
-	domainMatcher routing.DomainMatcher // All domain matchSets use one DomainMatcher.
-	ipSet         []*trie.Trie
+	mu               sync.RWMutex
+	closed           bool
+	rustMatcher      *rustDnsResponseMatcherRuntime
+	domainMatcher    routing.DomainMatcher // All domain matchSets use one DomainMatcher.
+	domainBitmapPool *sync.Pool
+	ipSet            []*trie.Trie
 
 	matches []responseMatchSet
+}
+
+func (m *ResponseMatcher) Close() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return
+	}
+	m.closed = true
+	if m.rustMatcher != nil {
+		m.rustMatcher.Close()
+		return
+	}
+	if closer, ok := m.domainMatcher.(routing.DomainMatcherCloser); ok {
+		closer.Close()
+	}
 }
 
 type responseMatchSet struct {
@@ -221,10 +255,24 @@ func (m *ResponseMatcher) Match(
 	ips []netip.Addr,
 	upstream consts.DnsRequestOutboundIndex,
 ) (upstreamIndex consts.DnsResponseOutboundIndex, err error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return 0, fmt.Errorf("dns response matcher is closed")
+	}
+	if m.rustMatcher != nil {
+		return m.rustMatcher.Match(qName, qType, ips, upstream)
+	}
 	if qName == "" {
 		return 0, fmt.Errorf("qName cannot be empty")
 	}
-	domainMatchBitmap := m.domainMatcher.MatchDomainBitmap(qName)
+	domainMatchBitmap, domainBitmapBuffer, err := routing.MatchDomainBitmapWithPool(m.domainMatcher, m.domainBitmapPool, qName)
+	if err != nil {
+		return 0, fmt.Errorf("match domain bitmap: %w", err)
+	}
+	if domainBitmapBuffer != nil {
+		defer routing.PutDomainBitmap(m.domainBitmapPool, domainBitmapBuffer)
+	}
 	bin128 := make([]string, 0, len(ips))
 	for _, ip := range ips {
 		bin128 = append(bin128, trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(ip.As16()), 128)))

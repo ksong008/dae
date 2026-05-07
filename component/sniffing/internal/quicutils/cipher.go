@@ -8,13 +8,11 @@ package quicutils
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/sha256"
 	"encoding/binary"
 	"io"
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/outbound/pool"
-	"golang.org/x/crypto/hkdf"
 )
 
 const (
@@ -29,34 +27,42 @@ var (
 )
 
 type Keys struct {
-	version             Version
-	clientInitialSecret []byte
-	key                 []byte
-	iv                  []byte
-	headerProtectionKey []byte
-	newAead             func(key []byte) (cipher.AEAD, error)
+	version                Version
+	clientInitialSecret    []byte
+	key                    []byte
+	iv                     []byte
+	headerProtectionKey    []byte
+	clientInitialSecretBuf [32]byte
+	keyBuf                 [16]byte
+	ivBuf                  [12]byte
+	headerProtectionKeyBuf [16]byte
+	newAead                func(key []byte) (cipher.AEAD, error)
+	headerProtection       cipher.Block
+	aead                   cipher.AEAD
+	headerProtectionMask   [aes.BlockSize]byte
 }
 
 func (k *Keys) Close() error {
-	pool.Put(k.clientInitialSecret)
-	pool.Put(k.headerProtectionKey)
-	pool.Put(k.iv)
-	pool.Put(k.key)
+	k.clientInitialSecret = nil
+	k.headerProtectionKey = nil
+	k.iv = nil
+	k.key = nil
 	return nil
 }
 
 func NewKeys(clientDstConnectionId []byte, version Version, newAead func(key []byte) (cipher.AEAD, error)) (keys *Keys, err error) {
 	// https://datatracker.ietf.org/doc/html/rfc9001#name-keys
-	initialSecret := hkdf.Extract(sha256.New, clientDstConnectionId, version.InitialSalt())
-	clientInitialSecret, err := HkdfExpandLabelFromPool(sha256.New, initialSecret, InitialClientLabel, nil, 32)
-	if err != nil {
+	var initialSecret [32]byte
+	if err = HkdfExtractSHA256Into(version.InitialSalt(), clientDstConnectionId, initialSecret[:]); err != nil {
 		return nil, err
 	}
-
 	keys = &Keys{
-		clientInitialSecret: clientInitialSecret,
-		version:             version,
-		newAead:             newAead,
+		version: version,
+		newAead: newAead,
+	}
+	keys.clientInitialSecret = keys.clientInitialSecretBuf[:]
+	if err = HkdfExpandLabelSHA256Into(initialSecret[:], InitialClientLabel, nil, keys.clientInitialSecret); err != nil {
+		return nil, err
 	}
 	// We differentiated a deriveKeys func is just for example test.
 	if err = keys.deriveKeys(); err != nil {
@@ -68,15 +74,26 @@ func NewKeys(clientDstConnectionId []byte, version Version, newAead func(key []b
 }
 
 func (k *Keys) deriveKeys() (err error) {
-	k.key, err = HkdfExpandLabelFromPool(sha256.New, k.clientInitialSecret, k.version.KeyLabel(), nil, 16)
+	k.key = k.keyBuf[:]
+	err = HkdfExpandLabelSHA256Into(k.clientInitialSecret, k.version.KeyLabel(), nil, k.key)
 	if err != nil {
 		return err
 	}
-	k.iv, err = HkdfExpandLabelFromPool(sha256.New, k.clientInitialSecret, k.version.IvLabel(), nil, 12)
+	k.iv = k.ivBuf[:]
+	err = HkdfExpandLabelSHA256Into(k.clientInitialSecret, k.version.IvLabel(), nil, k.iv)
 	if err != nil {
 		return err
 	}
-	k.headerProtectionKey, err = HkdfExpandLabelFromPool(sha256.New, k.clientInitialSecret, k.version.HpLabel(), nil, 16)
+	k.headerProtectionKey = k.headerProtectionKeyBuf[:]
+	err = HkdfExpandLabelSHA256Into(k.clientInitialSecret, k.version.HpLabel(), nil, k.headerProtectionKey)
+	if err != nil {
+		return err
+	}
+	k.headerProtection, err = aes.NewCipher(k.headerProtectionKey)
+	if err != nil {
+		return err
+	}
+	k.aead, err = k.newAead(k.key)
 	if err != nil {
 		return err
 	}
@@ -85,14 +102,9 @@ func (k *Keys) deriveKeys() (err error) {
 
 // HeaderProtection_ encrypt/decrypt firstByte and packetNumber in place.
 func (k *Keys) HeaderProtection_(sample []byte, longHeader bool, firstByte *byte, potentialPacketNumber []byte) (packetNumber []byte, err error) {
-	block, err := aes.NewCipher(k.headerProtectionKey)
-	if err != nil {
-		return nil, err
-	}
 	// Get mask.
-	mask := pool.Get(block.BlockSize())
-	defer pool.Put(mask)
-	block.Encrypt(mask, sample)
+	mask := k.headerProtectionMask[:]
+	k.headerProtection.Encrypt(mask, sample)
 	// Encrypt/decrypt first byte.
 	if longHeader {
 		// Long header: 4 bits masked
@@ -117,19 +129,32 @@ func (k *Keys) HeaderProtection_(sample []byte, longHeader bool, firstByte *byte
 func (k *Keys) PayloadDecrypt(ciphertext []byte, packetNumber []byte, header []byte) (plaintext []byte, err error) {
 	// https://datatracker.ietf.org/doc/html/rfc9001#name-initial-secrets
 
-	aead, err := k.newAead(k.key)
-	if err != nil {
-		return nil, err
-	}
 	// We only decrypt once, so we do not need to XOR it back.
 	// https://github.com/quic-go/qtls-go1-20/blob/e132a0e6cb45e20ac0b705454849a11d09ba5a54/cipher_suites.go#L496
+	var nonce [12]byte
+	copy(nonce[:], k.iv)
 	for i := range packetNumber {
-		k.iv[len(k.iv)-len(packetNumber)+i] ^= packetNumber[i]
+		nonce[len(k.iv)-len(packetNumber)+i] ^= packetNumber[i]
 	}
-	plaintext = make([]byte, len(ciphertext)-aead.Overhead())
-	plaintext, err = aead.Open(plaintext[:0], k.iv, ciphertext, header)
+	plaintext = make([]byte, len(ciphertext)-k.aead.Overhead())
+	plaintext, err = k.aead.Open(plaintext[:0], nonce[:len(k.iv)], ciphertext, header)
 	if err != nil {
 		// Do nothing.
+	}
+	return plaintext, nil
+}
+
+func (k *Keys) PayloadDecryptFromPool(ciphertext []byte, packetNumber []byte, header []byte) (plaintext []byte, err error) {
+	var nonce [12]byte
+	copy(nonce[:], k.iv)
+	for i := range packetNumber {
+		nonce[len(k.iv)-len(packetNumber)+i] ^= packetNumber[i]
+	}
+	plaintext = pool.Get(len(ciphertext) - k.aead.Overhead())
+	plaintext, err = k.aead.Open(plaintext[:0], nonce[:len(k.iv)], ciphertext, header)
+	if err != nil {
+		pool.Put(plaintext)
+		return nil, err
 	}
 	return plaintext, nil
 }
@@ -145,6 +170,18 @@ func DecryptQuic_(header []byte, blockEnd int, destConnId []byte) (plaintext []b
 		return nil, err
 	}
 	defer keys.Close()
+	return DecryptQuicWithKeys_(header, blockEnd, keys)
+}
+
+func DecryptQuicWithKeys_(header []byte, blockEnd int, keys *Keys) (plaintext []byte, err error) {
+	return decryptQuicWithKeys(header, blockEnd, keys, false)
+}
+
+func DecryptQuicWithKeysFromPool_(header []byte, blockEnd int, keys *Keys) (plaintext []byte, err error) {
+	return decryptQuicWithKeys(header, blockEnd, keys, true)
+}
+
+func decryptQuicWithKeys(header []byte, blockEnd int, keys *Keys, fromPool bool) (plaintext []byte, err error) {
 	if blockEnd-len(header) < SampleSize {
 		return nil, io.ErrUnexpectedEOF
 	}
@@ -159,7 +196,11 @@ func DecryptQuic_(header []byte, blockEnd int, destConnId []byte) (plaintext []b
 	header = header[:len(header)-MaxPacketNumberLength+len(packetNumber)] // Correct header
 	payload := header[len(header):blockEnd]                               // Correct payload
 
-	plaintext, err = keys.PayloadDecrypt(payload, packetNumber, header)
+	if fromPool {
+		plaintext, err = keys.PayloadDecryptFromPool(payload, packetNumber, header)
+	} else {
+		plaintext, err = keys.PayloadDecrypt(payload, packetNumber, header)
+	}
 	if err != nil {
 		return nil, err
 	}

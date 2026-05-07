@@ -1,0 +1,66 @@
+name: daerust
+
+on:
+  push:
+    branches:
+      - daerust
+  pull_request:
+    branches:
+      - daerust
+  workflow_dispatch:
+
+permissions: read-all
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: daerust-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rollout-gate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.9"
+          cache-dependency-path: |
+            go.mod
+            go.sum
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang-15 llvm-15
+
+      - name: Prepare location assets
+        run: |
+          mkdir -p .github/dae-assets
+          curl -L -o .github/dae-assets/geoip.dat https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+          curl -L -o .github/dae-assets/geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+
+      - name: Generate eBPF artifacts
+        env:
+          CLANG: clang-15
+          STRIP: llvm-strip-15
+        run: make ebpf
+
+      - name: Run daerust rollout gate
+        env:
+          DAE_LOCATION_ASSET: ${{ github.workspace }}/.github/dae-assets
+        run: make rust-rollout-gate-local

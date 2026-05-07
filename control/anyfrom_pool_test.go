@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -68,7 +69,7 @@ func TestAnyfromPoolSweepExpired(t *testing.T) {
 	pool.now = func() time.Time { return now }
 
 	closeCount := 0
-	pool.pool["127.0.0.1:12345"] = &Anyfrom{
+	pool.pool[netip.MustParseAddrPort("127.0.0.1:12345")] = &Anyfrom{
 		ttl:        time.Second,
 		lastActive: now.Add(-2 * time.Second),
 		closeFunc: func() error {
@@ -93,7 +94,7 @@ func TestAnyfromPoolDoesNotSweepFreshEntries(t *testing.T) {
 	now := time.Now()
 	pool.now = func() time.Time { return now }
 
-	pool.pool["127.0.0.1:12346"] = &Anyfrom{
+	pool.pool[netip.MustParseAddrPort("127.0.0.1:12346")] = &Anyfrom{
 		ttl:        time.Second,
 		lastActive: now,
 		closeFunc:  func() error { return nil },
@@ -121,7 +122,7 @@ func TestAnyfromPoolCloseClosesEntries(t *testing.T) {
 	pool := NewAnyfromPool()
 
 	closeCount := 0
-	pool.pool["127.0.0.1:12347"] = &Anyfrom{
+	pool.pool[netip.MustParseAddrPort("127.0.0.1:12347")] = &Anyfrom{
 		ttl:        time.Second,
 		lastActive: time.Now(),
 		closeFunc: func() error {
@@ -150,7 +151,7 @@ func TestAnyfromPoolEvictsOldestWhenFull(t *testing.T) {
 
 	closeCount := 0
 	for i := 0; i < anyfromPoolMaxEntries; i++ {
-		pool.pool[fmt.Sprintf("127.0.0.1:%d", 20000+i)] = &Anyfrom{
+		pool.pool[netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", 20000+i))] = &Anyfrom{
 			ttl:        time.Minute,
 			lastActive: now.Add(time.Duration(-i) * time.Second),
 			closeFunc: func() error {

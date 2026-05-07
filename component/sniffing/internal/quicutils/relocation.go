@@ -8,7 +8,6 @@ package quicutils
 import (
 	"fmt"
 	"io/fs"
-	"sort"
 )
 
 var (
@@ -30,18 +29,19 @@ type CryptoFrameOffset struct {
 	Data []byte
 }
 
-func ReassembleCryptos(offsets []*CryptoFrameOffset, newPayload []byte) (newOffsets []*CryptoFrameOffset, err error) {
+func ReassembleCryptos(offsets []CryptoFrameOffset, newPayload []byte) (newOffsets []CryptoFrameOffset, err error) {
 	oldLen := len(offsets)
 	var frameSize int
-	var offset *CryptoFrameOffset
+	var offset CryptoFrameOffset
+	var ok bool
 	var boundary int
 	// Extract crypto frames.
 	for iNextFrame := 0; iNextFrame < len(newPayload); iNextFrame += frameSize {
-		offset, frameSize, err = ExtractCryptoFrameOffset(newPayload[iNextFrame:], iNextFrame)
+		offset, ok, frameSize, err = ExtractCryptoFrameOffset(newPayload[iNextFrame:], iNextFrame)
 		if err != nil {
 			return nil, err
 		}
-		if offset == nil {
+		if !ok {
 			continue
 		}
 		offsets = append(offsets, offset)
@@ -49,11 +49,6 @@ func ReassembleCryptos(offsets []*CryptoFrameOffset, newPayload []byte) (newOffs
 			boundary = offset.UpperAppOffset + len(offset.Data)
 		}
 	}
-	// Sort the new part.
-	newPart := offsets[oldLen:]
-	sort.Slice(newPart, func(i, j int) bool {
-		return newPart[i].UpperAppOffset < newPart[j].UpperAppOffset
-	})
 
 	// Insertion sort.
 	for i := oldLen; i < len(offsets); i++ {
@@ -63,9 +58,7 @@ func ReassembleCryptos(offsets []*CryptoFrameOffset, newPayload []byte) (newOffs
 			if item.UpperAppOffset < offsets[j].UpperAppOffset {
 				offsets[j+1] = offsets[j]
 			} else {
-				if offsets[j+1] != item {
-					offsets[j+1] = item
-				}
+				offsets[j+1] = item
 				break
 			}
 		}
@@ -76,42 +69,42 @@ func ReassembleCryptos(offsets []*CryptoFrameOffset, newPayload []byte) (newOffs
 	return offsets, nil
 }
 
-func ExtractCryptoFrameOffset(remainder []byte, transportOffset int) (offset *CryptoFrameOffset, frameSize int, err error) {
+func ExtractCryptoFrameOffset(remainder []byte, transportOffset int) (offset CryptoFrameOffset, ok bool, frameSize int, err error) {
 	if len(remainder) == 0 {
-		return nil, 0, fmt.Errorf("frame has no length: %w", ErrOutOfRange)
+		return CryptoFrameOffset{}, false, 0, fmt.Errorf("frame has no length: %w", ErrOutOfRange)
 	}
 	frameType, nextField, err := BigEndianUvarint(remainder)
 	if err != nil {
-		return nil, 0, err
+		return CryptoFrameOffset{}, false, 0, err
 	}
 	switch frameType {
 	case Quic_FrameType_Ping:
-		return nil, nextField, nil
+		return CryptoFrameOffset{}, false, nextField, nil
 	case Quic_FrameType_Padding:
 		for ; nextField < len(remainder) && remainder[nextField] == 0; nextField++ {
 		}
-		return nil, nextField, nil
+		return CryptoFrameOffset{}, false, nextField, nil
 	case Quic_FrameType_Crypto:
 		offset, n, err := BigEndianUvarint(remainder[nextField:])
 		if err != nil {
-			return nil, 0, err
+			return CryptoFrameOffset{}, false, 0, err
 		}
 		nextField += n
 
 		length, n, err := BigEndianUvarint(remainder[nextField:])
 		if err != nil {
-			return nil, 0, err
+			return CryptoFrameOffset{}, false, 0, err
 		}
 		nextField += n
 
-		return &CryptoFrameOffset{
+		return CryptoFrameOffset{
 			UpperAppOffset: int(offset),
 			Data:           remainder[nextField : nextField+int(length)],
-		}, nextField + int(length), nil
+		}, true, nextField + int(length), nil
 	case Quic_FrameType_ConnectionClose, Quic_FrameType_ConnectionClose2:
-		return nil, 0, fmt.Errorf("connection closed: %w", fs.ErrClosed)
+		return CryptoFrameOffset{}, false, 0, fmt.Errorf("connection closed: %w", fs.ErrClosed)
 	default:
-		return nil, 0, fmt.Errorf("%w: %v", ErrUnknownFrameType, frameType)
+		return CryptoFrameOffset{}, false, 0, fmt.Errorf("%w: %v", ErrUnknownFrameType, frameType)
 	}
 }
 
@@ -135,14 +128,19 @@ type LinearLocator struct {
 	baseEnd   int
 	baseStart int
 	baseData  []byte
-	o         []*CryptoFrameOffset
+	o         []CryptoFrameOffset
 }
 
-func NewLinearLocator(o []*CryptoFrameOffset) *LinearLocator {
+func NewLinearLocator(o []CryptoFrameOffset) *LinearLocator {
+	return new(LinearLocator).Reset(o)
+}
+
+func (l *LinearLocator) Reset(o []CryptoFrameOffset) *LinearLocator {
 	if len(o) == 0 {
-		return &LinearLocator{}
+		*l = LinearLocator{}
+		return l
 	}
-	return &LinearLocator{
+	*l = LinearLocator{
 		left:      0,
 		length:    o[len(o)-1].UpperAppOffset + len(o[len(o)-1].Data),
 		iOuter:    0,
@@ -151,6 +149,7 @@ func NewLinearLocator(o []*CryptoFrameOffset) *LinearLocator {
 		baseEnd:   o[0].UpperAppOffset + len(o[0].Data),
 		o:         o,
 	}
+	return l
 }
 
 func (l *LinearLocator) relocate(i int) error {

@@ -1,0 +1,24 @@
+# type	bit	kind	value_or_expected
+rule	0	suffix	test-ipv6.com
+rule	1	full	dns.google
+rule	2	full	_https._tcp.mirrors.ustc.edu.cn
+rule	3	keyword	ads
+rule	4	regex	^img.*\.csdn\.net$
+rule	5	suffix	alibaba.com
+rule	5	suffix	aliimg.com
+rule	6	keyword	traffic
+rule	7	regex	^.*\.gamingadult\.com$
+
+# type	domain	expected_first_word
+case	ipv4.master.test-ipv6.com	1
+case	dns.google.	2
+case	_https._tcp.mirrors.ustc.edu.cn	4
+case	ads.trafficjunky.net	72
+case	img-bss.csdn.net	16
+case	tm-banners.gamingadult.com	128
+case	static.javhd.com	0
+case	alibaba.com	32
+case	foo.alibaba.com	32
+case	aliimg.com	32
+case	trafficfactory.biz	64
+case	example.org	0

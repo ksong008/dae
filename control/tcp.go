@@ -48,7 +48,7 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err erro
 	dst = common.ConvergeAddrPort(dst)
 
 	// Dial and relay.
-	rConn, err := c.RouteDialTcp(&RouteDialParam{
+	rConn, err := c.RouteDialTcp(RouteDialParam{
 		Ctx:         reqCtx,
 		Outbound:    consts.OutboundIndex(routingResult.Outbound),
 		Domain:      domain,
@@ -92,8 +92,8 @@ type RouteDialParam struct {
 	Mark        uint32
 }
 
-func (c *ControlPlane) RouteDialTcp(p *RouteDialParam) (conn netproxy.Conn, err error) {
-	routingResult := &bpfRoutingResult{
+func (c *ControlPlane) RouteDialTcp(p RouteDialParam) (conn netproxy.Conn, err error) {
+	routingResult := bpfRoutingResult{
 		Mark:     p.Mark,
 		Must:     0,
 		Mac:      p.Mac,
@@ -107,15 +107,20 @@ func (c *ControlPlane) RouteDialTcp(p *RouteDialParam) (conn netproxy.Conn, err 
 	src := p.Src
 	dst := p.Dest
 
-	dialTarget, shouldReroute, dialIp := c.ChooseDialTarget(p.Ctx, src, routingResult, outboundIndex, dst, domain)
-	if shouldReroute {
-		outboundIndex = consts.OutboundControlPlaneRouting
+	var dialTarget string
+	dialIp := true
+	if outboundIndex != consts.OutboundControlPlaneRouting {
+		var shouldReroute bool
+		dialTarget, shouldReroute, dialIp = c.ChooseDialTarget(p.Ctx, src, &routingResult, outboundIndex, dst, domain)
+		if shouldReroute {
+			outboundIndex = consts.OutboundControlPlaneRouting
+		}
 	}
 
 	switch outboundIndex {
 	case consts.OutboundDirect:
 	case consts.OutboundControlPlaneRouting:
-		if outboundIndex, routingResult.Mark, _, err = c.Route(src, dst, domain, consts.L4ProtoType_TCP, routingResult); err != nil {
+		if outboundIndex, routingResult.Mark, _, err = c.Route(src, dst, domain, consts.L4ProtoType_TCP, &routingResult); err != nil {
 			return nil, err
 		}
 		routingResult.Outbound = uint8(outboundIndex)
@@ -127,7 +132,7 @@ func (c *ControlPlane) RouteDialTcp(p *RouteDialParam) (conn netproxy.Conn, err 
 			)
 		}
 		// Reset dialTarget.
-		dialTarget, _, dialIp = c.ChooseDialTarget(p.Ctx, src, routingResult, outboundIndex, dst, domain)
+		dialTarget, _, dialIp = c.ChooseDialTarget(p.Ctx, src, &routingResult, outboundIndex, dst, domain)
 	default:
 	}
 	if routingResult.Mark == 0 {

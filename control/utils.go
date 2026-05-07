@@ -20,6 +20,9 @@ import (
 )
 
 func (c *ControlPlane) Route(src, dst netip.AddrPort, domain string, l4proto consts.L4ProtoType, routingResult *bpfRoutingResult) (outboundIndex consts.OutboundIndex, mark uint32, must bool, err error) {
+	if c.routingMatcher == nil {
+		return 0, 0, false, fmt.Errorf("routing matcher is nil")
+	}
 	var ipVersion consts.IpVersionType
 	if dst.Addr().Is4() || dst.Addr().Is4In6() {
 		ipVersion = consts.IpVersion_4
@@ -28,9 +31,11 @@ func (c *ControlPlane) Route(src, dst netip.AddrPort, domain string, l4proto con
 	}
 	bSrc := src.Addr().As16()
 	bDst := dst.Addr().As16()
-	if outboundIndex, mark, must, err = c.routingMatcher.Match(
-		bSrc[:],
-		bDst[:],
+	var mac [16]byte
+	copy(mac[10:], routingResult.Mac[:])
+	outboundIndex, mark, must, err = c.routingMatcher.MatchAddr16(
+		&bSrc,
+		&bDst,
 		src.Port(),
 		dst.Port(),
 		ipVersion,
@@ -38,8 +43,9 @@ func (c *ControlPlane) Route(src, dst netip.AddrPort, domain string, l4proto con
 		domain,
 		routingResult.Pname,
 		routingResult.Dscp,
-		append([]uint8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, routingResult.Mac[:]...),
-	); err != nil {
+		&mac,
+	)
+	if err != nil {
 		return 0, 0, false, err
 	}
 

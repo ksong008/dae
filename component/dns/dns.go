@@ -27,16 +27,19 @@ var ErrBadUpstreamFormat = fmt.Errorf("bad upstream format")
 const dnsInitUpstreamConcurrency = 16
 
 type Dns struct {
-	log         *logrus.Logger
-	upstream    []*UpstreamResolver
-	reqMatcher  *RequestMatcher
-	respMatcher *ResponseMatcher
+	log                *logrus.Logger
+	upstream           []*UpstreamResolver
+	requestQTypePrefer uint16
+	rustRouting        *rustDnsRoutingRuntime
+	reqMatcher         *RequestMatcher
+	respMatcher        *ResponseMatcher
 }
 
 type NewOption struct {
 	Logger                  *logrus.Logger
 	LocationFinder          *assets.LocationFinder
 	UpstreamReadyCallback   func(dnsUpstream *Upstream) (err error)
+	RequestQTypePrefer      uint16
 	UpstreamResolverNetwork string
 	ResolverDialer          netproxy.Dialer
 	ResolverDNS             netip.AddrPort
@@ -44,7 +47,8 @@ type NewOption struct {
 
 func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 	s = &Dns{
-		log: opt.Logger,
+		log:                opt.Logger,
+		requestQTypePrefer: opt.RequestQTypePrefer,
 	}
 	// Parse upstream.
 	upstreamName2Id := map[string]uint8{}
@@ -110,24 +114,45 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
 	}
-	s.reqMatcher, err = reqMatcherBuilder.Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
-	}
 	// Parse response routing.
 	respMatcherBuilder, err := NewResponseMatcherBuilder(opt.Logger, dns.Routing.Response.Rules, upstreamName2Id, dns.Routing.Response.Fallback)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build DNS response routing: %w", err)
 	}
-	s.respMatcher, err = respMatcherBuilder.Build()
+	s.rustRouting, err = newRustDnsRoutingRuntime(reqMatcherBuilder, respMatcherBuilder)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build DNS response routing: %w", err)
+		return nil, fmt.Errorf("failed to build rust dns routing runtime: %w", err)
+	}
+	if s.rustRouting == nil {
+		s.reqMatcher, err = reqMatcherBuilder.Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
+		}
+		s.respMatcher, err = respMatcherBuilder.Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to build DNS response routing: %w", err)
+		}
 	}
 	if len(dns.Upstream) == 0 && opt != nil && opt.UpstreamReadyCallback != nil {
 		// Immediately ready.
 		go opt.UpstreamReadyCallback(nil)
 	}
 	return s, nil
+}
+
+func (s *Dns) Close() {
+	if s == nil {
+		return
+	}
+	if s.rustRouting != nil {
+		s.rustRouting.Close()
+	}
+	if s.reqMatcher != nil {
+		s.reqMatcher.Close()
+	}
+	if s.respMatcher != nil {
+		s.respMatcher.Close()
+	}
 }
 
 func (s *Dns) CheckUpstreamsFormat() error {
@@ -171,10 +196,18 @@ func (s *Dns) InitUpstreams() {
 
 func (s *Dns) RequestSelect(qname string, qtype uint16) (upstreamIndex consts.DnsRequestOutboundIndex, upstream *Upstream, err error) {
 	// Route.
-	upstreamIndex, err = s.reqMatcher.Match(qname, qtype)
+	if s.rustRouting != nil {
+		upstreamIndex, err = s.rustRouting.RequestMatch(qname, qtype)
+	} else {
+		upstreamIndex, err = s.reqMatcher.Match(qname, qtype)
+	}
 	if err != nil {
 		return 0, nil, err
 	}
+	return s.resolveRequestSelection(upstreamIndex)
+}
+
+func (s *Dns) resolveRequestSelection(upstreamIndex consts.DnsRequestOutboundIndex) (_ consts.DnsRequestOutboundIndex, upstream *Upstream, err error) {
 	// nil indicates AsIs.
 	if upstreamIndex == consts.DnsRequestOutboundIndex_AsIs ||
 		upstreamIndex == consts.DnsRequestOutboundIndex_Reject {
@@ -192,59 +225,35 @@ func (s *Dns) RequestSelect(qname string, qtype uint16) (upstreamIndex consts.Dn
 }
 
 func (s *Dns) ResponseSelect(msg *dnsmessage.Msg, fromUpstream *Upstream) (upstreamIndex consts.DnsResponseOutboundIndex, upstream *Upstream, err error) {
-	if !msg.Response {
-		return 0, nil, fmt.Errorf("DNS response expected but DNS request received")
-	}
-
-	// Prepare routing.
-	var qname string
-	var qtype uint16
-	var ips []netip.Addr
-	if len(msg.Question) == 0 {
-		qname = ""
-		qtype = 0
-	} else {
-		q := msg.Question[0]
-		qname = q.Name
-		qtype = q.Qtype
-		for _, ans := range msg.Answer {
-			var (
-				ip netip.Addr
-				ok bool
-			)
-			switch body := ans.(type) {
-			case *dnsmessage.A:
-				ip, ok = netip.AddrFromSlice(body.A)
-			case *dnsmessage.AAAA:
-				ip, ok = netip.AddrFromSlice(body.AAAA)
-			}
-			if !ok {
-				continue
-			}
-			ips = append(ips, ip)
-		}
-	}
-	from := int(consts.DnsRequestOutboundIndex_AsIs)
-	if fromUpstream != nil {
-		from = int(fromUpstream.Index)
-	}
-	// Route.
-	upstreamIndex, err = s.respMatcher.Match(qname, qtype, ips, consts.DnsRequestOutboundIndex(from))
+	qname, qtype, ips, from, err := responseRoutingInputFromMsg(msg, fromUpstream)
 	if err != nil {
 		return 0, nil, err
 	}
-	// Get corresponding upstream if upstream is neither 'accept' nor 'reject'.
-	if !upstreamIndex.IsReserved() {
-		if int(upstreamIndex) >= len(s.upstream) {
-			return 0, nil, fmt.Errorf("bad upstream index: %v not in [0, %v]", upstreamIndex, len(s.upstream)-1)
-		}
-		upstream, err = s.upstream[upstreamIndex].GetUpstream()
-		if err != nil {
-			return 0, nil, err
-		}
-	} else {
-		// Assign explicitly to let coder know.
-		upstream = nil
+	upstreamIndex, err = s.matchResponse(qname, qtype, ips, from)
+	if err != nil {
+		return 0, nil, err
 	}
-	return upstreamIndex, upstream, nil
+	upstream, err = s.resolveResponseSelection(upstreamIndex)
+	return upstreamIndex, upstream, err
+}
+
+func (s *Dns) matchResponse(qname string, qtype uint16, ips []netip.Addr, from consts.DnsRequestOutboundIndex) (consts.DnsResponseOutboundIndex, error) {
+	if s.rustRouting != nil {
+		return s.rustRouting.ResponseMatch(qname, qtype, ips, from)
+	}
+	return s.respMatcher.Match(qname, qtype, ips, from)
+}
+
+func (s *Dns) resolveResponseSelection(upstreamIndex consts.DnsResponseOutboundIndex) (upstream *Upstream, err error) {
+	if upstreamIndex == consts.DnsResponseOutboundIndex_Accept ||
+		upstreamIndex == consts.DnsResponseOutboundIndex_Reject {
+		return nil, nil
+	}
+	if upstreamIndex.IsReserved() {
+		return nil, fmt.Errorf("bad reserved response upstream index: %v", upstreamIndex)
+	}
+	if int(upstreamIndex) >= len(s.upstream) {
+		return nil, fmt.Errorf("bad upstream index: %v not in [0, %v]", upstreamIndex, len(s.upstream)-1)
+	}
+	return s.upstream[upstreamIndex].GetUpstream()
 }

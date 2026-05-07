@@ -5,8 +5,10 @@ import (
 	"errors"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/routing"
 	"github.com/sirupsen/logrus"
 )
 
@@ -107,5 +109,75 @@ func TestControlPlaneCloseReturnsCleanupErrors(t *testing.T) {
 
 	if err := plane.Close(); !errors.Is(err, expected) {
 		t.Fatalf("Close() error = %v, want cleanup error", err)
+	}
+}
+
+type controlPlaneTestDomainMatcher struct {
+	closeCount int
+}
+
+func (m *controlPlaneTestDomainMatcher) AddSet(int, []string, consts.RoutingDomainKey) {}
+
+func (m *controlPlaneTestDomainMatcher) Build() error { return nil }
+
+func (m *controlPlaneTestDomainMatcher) MatchDomainBitmap(string) []uint32 {
+	return []uint32{0}
+}
+
+func (m *controlPlaneTestDomainMatcher) Close() {
+	m.closeCount++
+}
+
+type controlPlaneFixedBitmapMatcher struct {
+	bitmap []uint32
+}
+
+func (m *controlPlaneFixedBitmapMatcher) AddSet(int, []string, consts.RoutingDomainKey) {}
+func (m *controlPlaneFixedBitmapMatcher) Build() error                                  { return nil }
+func (m *controlPlaneFixedBitmapMatcher) MatchDomainBitmap(string) []uint32 {
+	return append([]uint32(nil), m.bitmap...)
+}
+
+var (
+	_ routing.DomainMatcher       = (*controlPlaneTestDomainMatcher)(nil)
+	_ routing.DomainMatcherCloser = (*controlPlaneTestDomainMatcher)(nil)
+	_ routing.DomainMatcher       = (*controlPlaneFixedBitmapMatcher)(nil)
+)
+
+func TestRoutingMatcherClosePreventsDomainMatcherUse(t *testing.T) {
+	domainMatcher := &controlPlaneTestDomainMatcher{}
+	matcher := &RoutingMatcher{domainMatcher: domainMatcher}
+
+	matcher.Close()
+	matcher.Close()
+
+	if domainMatcher.closeCount != 1 {
+		t.Fatalf("domain matcher close count = %d, want 1", domainMatcher.closeCount)
+	}
+	if _, err := matcher.MatchDomainBitmap("example.com"); err == nil {
+		t.Fatal("MatchDomainBitmap after Close() error = nil, want error")
+	}
+}
+
+func TestNewDnsCacheEntryUsesRoutingMatcherBitmap(t *testing.T) {
+	plane := &ControlPlane{
+		routingMatcher: &RoutingMatcher{
+			domainMatcher: &controlPlaneFixedBitmapMatcher{bitmap: []uint32{3}},
+		},
+	}
+	cache, err := plane.newDnsCacheEntry(
+		"example.com.",
+		nil,
+		time.Now(),
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatalf("newDnsCacheEntry() error = %v", err)
+	}
+	if len(cache.DomainBitmap) != 1 || cache.DomainBitmap[0] != 3 {
+		t.Fatalf("unexpected domain bitmap: %#v", cache.DomainBitmap)
+	}
+	if cache.HasAnyIP {
+		t.Fatal("expected empty answers to report HasAnyIP=false")
 	}
 }

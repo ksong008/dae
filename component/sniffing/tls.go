@@ -29,6 +29,10 @@ var (
 
 // SniffTls only supports tls1.2, tls1.3
 func (s *Sniffer) SniffTls() (d string, err error) {
+	if d, err, ok := s.trySniffTLSRust(); ok {
+		return d, err
+	}
+
 	// The Transport Layer Security (TLS) Protocol Version 1.3
 	// https://www.rfc-editor.org/rfc/rfc8446#page-27
 	boundary := 5
@@ -112,19 +116,18 @@ func extractSniFromTls(search quicutils.Locator) (sni string, err error) {
 	if search.Len() < boundary || search.Len() < boundary {
 		return "", ErrNotApplicable
 	}
-	// Search SNI
-	extensions, err := search.Slice(boundary-extensionsLength, boundary)
-	if err != nil {
-		return "", err
-	}
-	return findSniExtension(extensions)
+	return findSniExtensionRange(search, boundary-extensionsLength, boundary)
 }
 
 func findSniExtension(search quicutils.Locator) (d string, err error) {
-	i := 0
+	return findSniExtensionRange(search, 0, search.Len())
+}
+
+func findSniExtensionRange(search quicutils.Locator, start, end int) (d string, err error) {
+	i := start
 	var b []byte
 	for {
-		if i+4 >= search.Len() {
+		if i+4 >= end {
 			return "", ErrNotFound
 		}
 		b, err = search.Range(i, i+4)
@@ -135,7 +138,7 @@ func findSniExtension(search quicutils.Locator) (d string, err error) {
 		extLength := int(binary.BigEndian.Uint16(b[2:]))
 
 		iNextField := i + 4 + extLength
-		if iNextField > search.Len() {
+		if iNextField > end {
 			return "", ErrNotApplicable
 		}
 		if typ == TlsExtension_ServerName {

@@ -79,7 +79,7 @@ func buildDomainRoutingOwnerSnapshot(cache *DnsCache) (domainRoutingOwnerSnapsho
 	}
 	var snapshot domainRoutingOwnerSnapshot
 	copy(snapshot.bitmap.Bitmap[:], cache.DomainBitmap)
-	ips := cache.cachedIPs()
+	ips := cache.CachedIPs()
 	if len(ips) == 0 {
 		return snapshot, nil
 	}

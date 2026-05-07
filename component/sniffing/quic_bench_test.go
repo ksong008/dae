@@ -20,8 +20,14 @@ var QuicStream, _ = hex.DecodeString("c00000000108d60451e5cb0f7050000044bc9acdca
 func BenchmarkReassembleCryptoToBytesFromPool(b *testing.B) {
 	logrus.SetLevel(logrus.DebugLevel)
 	for i := 0; i < b.N; i++ {
-		sniffer := NewPacketSniffer(QuicStream, 300*time.Millisecond)
+		sniffer := NewPacketSniffer(nil, 300*time.Millisecond)
+		sniffer.AppendData(QuicStream2_1)
 		d, err := sniffer.SniffQuic()
+		if err != nil && sniffer.NeedMore() {
+			sniffer.AppendData(QuicStream2_2)
+			d, err = sniffer.SniffQuic()
+		}
+		_ = sniffer.Close()
 		if err != nil {
 			b.Fatal(err)
 		}
