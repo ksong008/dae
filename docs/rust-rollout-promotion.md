@@ -74,6 +74,9 @@ There are also branch-specific workflows now:
 
 These are not reused from the older `daenew`, `daewing2.0`, or `daed2.0` lines. Each branch now has its own explicitly named workflow and gate surface.
 
+Remote thresholds are intentionally looser than the local workstation thresholds.
+The current `daerust-promotion` workflow overrides the benchmark limits for GitHub-hosted runners, while `rust-promotion-gate-local` keeps the stricter local defaults.
+
 ## Promotion rule
 
 The current staged Rust path is promotion-ready only when all of these are true:
