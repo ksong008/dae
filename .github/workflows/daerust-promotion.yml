@@ -36,6 +36,11 @@ jobs:
   promotion:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    env:
+      DAE_WING_REPOSITORY: ${{ inputs.dae_wing_repository || 'ksong008/dae-wing' }}
+      DAE_WING_REF: ${{ inputs.dae_wing_ref || 'daewingrust' }}
+      DAED_REPOSITORY: ${{ inputs.daed_repository || 'ksong008/daed' }}
+      DAED_REF: ${{ inputs.daed_ref || 'daedrust' }}
 
     steps:
       - name: Checkout dae
@@ -48,8 +53,8 @@ jobs:
       - name: Checkout dae-wing
         uses: actions/checkout@v5
         with:
-          repository: ${{ inputs.dae_wing_repository }}
-          ref: ${{ inputs.dae_wing_ref }}
+          repository: ${{ env.DAE_WING_REPOSITORY }}
+          ref: ${{ env.DAE_WING_REF }}
           fetch-depth: 0
           submodules: recursive
           path: dae-wing
@@ -57,8 +62,8 @@ jobs:
       - name: Checkout daed
         uses: actions/checkout@v5
         with:
-          repository: ${{ inputs.daed_repository }}
-          ref: ${{ inputs.daed_ref }}
+          repository: ${{ env.DAED_REPOSITORY }}
+          ref: ${{ env.DAED_REF }}
           fetch-depth: 0
           submodules: recursive
           path: daed

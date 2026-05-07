@@ -68,6 +68,12 @@ The `daed/wing` overlay is intentional. It lets the remote gate validate the liv
 
 At the current stage this workflow also listens to `push` on `daerust`.
 That is intentional: the workflow file is not on the default branch yet, so `workflow_dispatch` alone is not enough for immediate remote validation on the Rust branch line.
+For `push`-triggered runs, the downstream repo/ref defaults are resolved inside the workflow itself:
+
+- `ksong008/dae-wing@daewingrust`
+- `ksong008/daed@daedrust`
+
+so the promotion flow does not depend on `workflow_dispatch` inputs being present.
 
 The promotion workflow currently installs the `daed` web workspace with `pnpm install --no-frozen-lockfile`.
 That is deliberate for this staged branch line: the cross-repo overlay shape is the thing being validated, and the workflow should not fail early only because the checked-out downstream workspace does not expose a lockfile in the exact shape expected by `frozen-lockfile`.
