@@ -66,6 +66,9 @@ Then it:
 
 The `daed/wing` overlay is intentional. It lets the remote gate validate the live `daewingrust` checkout together with `daedrust`, instead of depending on a previously advanced submodule pointer.
 
+At the current stage this workflow also listens to `push` on `daerust`.
+That is intentional: the workflow file is not on the default branch yet, so `workflow_dispatch` alone is not enough for immediate remote validation on the Rust branch line.
+
 There are also branch-specific workflows now:
 
 - `.github/workflows/daerust.yml`
