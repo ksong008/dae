@@ -5,6 +5,8 @@
 
 package consts
 
+const LocationAssetFolder = "dae"
+
 var (
 	AppName = "dae"
 )
