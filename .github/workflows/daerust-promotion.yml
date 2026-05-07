@@ -72,9 +72,6 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: "22.12.0"
-          cache: pnpm
-          cache-dependency-path: |
-            daed/pnpm-lock.yaml
 
       - name: Set up Go
         uses: actions/setup-go@v6
