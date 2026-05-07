@@ -3,6 +3,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ASSET_DIR="${DAE_LOCATION_ASSET:-$ROOT/.github/dae-assets}"
+HTTP_MAX_NS="${RUST_HTTP_MAX_NS:-80}"
+TLS_MAX_NS="${RUST_TLS_MAX_NS:-65}"
+QUIC_MAX_NS="${RUST_QUIC_MAX_NS:-1100}"
+ROUTE_MAX_NS="${RUST_ROUTE_MAX_NS:-900}"
+ROUTE_MAX_B="${RUST_ROUTE_MAX_B:-400}"
+ROUTE_MAX_ALLOCS="${RUST_ROUTE_MAX_ALLOCS:-6}"
 
 check_benchmark() {
   local file="$1"
@@ -53,9 +59,9 @@ go test -tags='rust_sniffing' ./component/sniffing \
   -bench 'Benchmark(RustQuicInitialSNIReuseScratch|RustHTTPHostInto|RustTLSSNIInto)$' \
   -benchmem -benchtime=500ms -count=3 | tee "$sniff_bench"
 
-check_benchmark "$sniff_bench" '^BenchmarkRustHTTPHostInto-' 80 0 0
-check_benchmark "$sniff_bench" '^BenchmarkRustTLSSNIInto-' 65 0 0
-check_benchmark "$sniff_bench" '^BenchmarkRustQuicInitialSNIReuseScratch-' 1100 0 0
+check_benchmark "$sniff_bench" '^BenchmarkRustHTTPHostInto-' "$HTTP_MAX_NS" 0 0
+check_benchmark "$sniff_bench" '^BenchmarkRustTLSSNIInto-' "$TLS_MAX_NS" 0 0
+check_benchmark "$sniff_bench" '^BenchmarkRustQuicInitialSNIReuseScratch-' "$QUIC_MAX_NS" 0 0
 
 PATH=/root/.local/go1.25.9/bin:$PATH \
 DAE_LOCATION_ASSET="$ASSET_DIR" \
@@ -65,4 +71,4 @@ go test -tags='rust_dns_request_matcher rust_userspace_routing' ./control \
   -bench 'BenchmarkRustControlPlaneCombinedRouteDialTcp$' \
   -benchmem -benchtime=500ms -count=3 | tee "$route_bench"
 
-check_benchmark "$route_bench" '^BenchmarkRustControlPlaneCombinedRouteDialTcp-' 900 400 6
+check_benchmark "$route_bench" '^BenchmarkRustControlPlaneCombinedRouteDialTcp-' "$ROUTE_MAX_NS" "$ROUTE_MAX_B" "$ROUTE_MAX_ALLOCS"

@@ -47,7 +47,7 @@ ROLL_OUT_ASSET ?= $(PWD)/.github/dae-assets
 DAE_WING_REPO_DIR ?= ../dae-wing
 DAED_REPO_DIR ?= ../daed
 
-.PHONY: clean-ebpf ebpf dae submodule submodules rust-rollout-gate-local rust-rollout-chain-local rust-promotion-gate-local
+.PHONY: clean-ebpf ebpf ebpf-test-objects dae submodule submodules rust-rollout-gate-local rust-rollout-chain-local rust-promotion-gate-local
 
 ## Begin Dae Build
 dae: export GOOS=linux
@@ -126,9 +126,22 @@ ebpf-test: submodule clean-ebpf
     go clean -testcache && \
     go test -v ./control/kern/tests/...
 
+ebpf-test-objects: export BPF_CLANG := $(CLANG)
+ebpf-test-objects: export BPF_STRIP_FLAG := $(STRIP_FLAG)
+ebpf-test-objects: export BPF_CFLAGS := $(CFLAGS)
+ebpf-test-objects: export BPF_TARGET := $(TARGET)
+ebpf-test-objects: export BPF_TRACE_TARGET := $(GOARCH)
+ebpf-test-objects: submodule
+	@unset GOOS && \
+	unset GOARCH && \
+	unset GOARM && \
+	echo $(STRIP_FLAG) && \
+	go generate ./control/kern/tests/bpf_test.go
+
 ## End Ebpf
 
 rust-rollout-gate-local:
+	$(MAKE) ebpf
 	cargo test --manifest-path rust/Cargo.toml -p dae-domain-matcher
 	cargo build --manifest-path rust/Cargo.toml --release -p dae-domain-matcher
 	cargo test --manifest-path rust/Cargo.toml -p dae-sniffing
@@ -137,6 +150,7 @@ rust-rollout-gate-local:
 	DAE_LOCATION_ASSET=$(ROLL_OUT_ASSET) CGO_ENABLED=1 go test -tags='$(RUST_SNIFFING_TAGS)' ./component/sniffing -run '^$$' -bench 'Benchmark(RustQuicInitialSNIReuseScratch|RustHTTPHostInto|RustTLSSNIInto)$$' -benchmem -benchtime=500ms -count=3
 	DAE_LOCATION_ASSET=$(ROLL_OUT_ASSET) CGO_ENABLED=1 go test -tags='$(RUST_ROLLOUT_TAGS)' ./control -run 'TestRustControlPlaneCombinedDnsAndRoutingIntegration' -count=1
 	DAE_LOCATION_ASSET=$(ROLL_OUT_ASSET) CGO_ENABLED=1 go test -tags='$(RUST_ROLLOUT_TAGS)' ./control -run '^$$' -bench 'BenchmarkRustControlPlaneCombinedRouteDialTcp$$' -benchmem -benchtime=500ms -count=3
+	$(MAKE) ebpf-test-objects
 	DAE_LOCATION_ASSET=$(ROLL_OUT_ASSET) CGO_ENABLED=1 go test -tags='$(RUST_FULL_ROLLOUT_TAGS)' ./... -run '^$$'
 
 rust-rollout-chain-local:
